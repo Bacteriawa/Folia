@@ -162,8 +162,7 @@ To properly understand API additions, please read
 
 This fork includes significant enhancements to Folia's core scheduling system,
 improving fairness, performance, and adaptability while maintaining the strict
-20TPS fixed tick rate constraint. All enhancements are fully integrated into
-the core scheduling algorithms and are production-ready.
+20TPS fixed tick rate constraint.
 
 #### Key Features
 
