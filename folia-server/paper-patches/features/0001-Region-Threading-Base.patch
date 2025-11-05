@@ -670,7 +670,7 @@ index afe793c35f05a80058e80bcaee76ac45a40b04a2..9ddbb2d72e11c6abbbdb866f3010f276
  
  
 diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
-index 792ef37481ecd20134e2e41fccf4f124bfb8b7ea..52e96c3cc42f9c418b54b4a94b7a9f56c2d6076b 100644
+index 356ae572485dc84c2301c1a906303362e4c438ac..9a00f8e963ce73144e7b7ab452d602f98a8154ad 100644
 --- a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
 +++ b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
 @@ -256,12 +256,7 @@ class PaperPluginInstanceManager {
@@ -3787,7 +3787,7 @@ index 9851c3890c9377d9fd1813f82766c2841ae48fd4..034b210ca024dcb3d9f59f1cdeef8c16
      }
  
 diff --git a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
-index 49ce3fdcb8f3f6125e60bf667d79f23cc1629085..00416e0fe016b1e6502a0b57ffc623c68e8f2893 100644
+index 9878d6842ec77b9a01c08046459f7d320e4c47fb..5624ea2ca00f4b7a574475a0c876206f18a0465b 100644
 --- a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
 +++ b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
 @@ -819,7 +819,7 @@ public class CraftEventFactory {

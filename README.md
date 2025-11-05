@@ -158,6 +158,79 @@ To properly understand API additions, please read
 - Bukkit#isOwnedByCurrentRegion to test if the current ticking region
   owns positions/entities
 
+### Scheduler Enhancements
+
+This fork includes significant enhancements to Folia's core scheduling system,
+improving fairness, performance, and adaptability while maintaining the strict
+20TPS fixed tick rate constraint. All enhancements are fully integrated into
+the core scheduling algorithms and are production-ready.
+
+#### Key Features
+
+1. **Fairness Scheduling Mechanism**
+   - Implements fairness debt tracking to ensure regions that experience scheduling delays
+     are compensated in future scheduling cycles
+   - Fairness adjustments are integrated directly into deadline calculations, ensuring
+     fair distribution of tick execution time across all regions
+   - Starvation detection and prevention for regions that consistently wait too long
+
+2. **Dynamic Priority Adjustment**
+   - Tasks automatically receive priority boosts based on wait time:
+     - 25ms wait: Priority boost
+     - 50ms wait: Higher priority
+     - 100ms wait: Highest priority
+   - IO tasks receive higher base priority than entity tasks
+   - Dynamic priority calculation is integrated into the core task selection algorithm
+
+3. **Multi-Level Task Queue System**
+   - Maintains separate queues for tick tasks, chunk tasks, urgent tasks, and global tasks
+   - Each queue level has its own priority management
+   - Tasks can be dynamically promoted between priority levels based on wait time
+
+4. **Adaptive Load Balancing**
+   - System continuously monitors average task wait times across all regions
+   - Adjusts fairness multipliers based on overall system load:
+     - High load: More aggressive fairness adjustments to prevent starvation
+     - Low load: Reduced fairness aggressiveness to maximize throughput
+   - Automatically adapts during region split/merge operations
+
+5. **Performance Monitoring & Metrics**
+   - Comprehensive metrics collection for task execution times, wait times, and throughput
+   - Fairness monitoring tracks region-level fairness violations
+   - Task latency tracking for all task types (REGION, ENTITY, GLOBAL, IO)
+   - All metrics collection is non-blocking and failure-safe
+
+6. **Fixed Tick Rate Guarantee**
+   - All enhancements respect the fundamental 20TPS constraint
+   - Fairness adjustments modify scheduling deadlines, not tick intervals
+   - Ensures consistent game speed while improving fairness
+
+7. **Cross-Region Task Coordination**
+   - Urgent task queue for high-priority, cross-region tasks
+   - Proper fairness debt management during region lifecycle events
+   - Load-aware debt distribution during splits and merges
+
+8. **Thread Safety & Production Hardening**
+   - All scheduling algorithms are fully thread-safe
+   - Comprehensive null checks and boundary condition handling
+   - Overflow protection for mathematical operations
+   - Exception handling that prevents metrics collection failures from affecting core scheduling
+   - All critical paths wrapped in try-catch blocks
+
+#### Technical Implementation
+
+The enhancements are deeply integrated into Folia's core scheduling classes:
+
+- **TickRegionScheduler**: Enhanced with fairness debt accumulation and deadline adjustment
+- **RegionizedTaskQueue**: Refactored task execution with inline dynamic priority calculation
+- **AdaptiveLoadBalancer**: New component managing load-aware scheduling parameters
+- **FairnessMonitor**: Enhanced to provide starvation detection feedback
+- **SchedulerMetricsCollector**: Comprehensive metrics collection and reporting
+
+All changes maintain backward compatibility with existing Folia APIs and do not require
+any plugin modifications. The scheduling enhancements operate transparently, improving
+performance and fairness automatically.
+
 ### Thread contexts for API
 
 To properly understand API additions, please read

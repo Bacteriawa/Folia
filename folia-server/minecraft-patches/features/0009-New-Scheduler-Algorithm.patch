@@ -1,0 +1,1844 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bacteriawa <A3167717663@hotmail.com>
+Date: Tue, 4 Nov 2025 02:04:40 +0800
+Subject: [PATCH] New Scheduler Algorithm
+
+
+diff --git a/io/papermc/paper/threadedregions/RegionizedServer.java b/io/papermc/paper/threadedregions/RegionizedServer.java
+index e1842ab8f20271a8b20ab8462b09a4745a612a9a..8abf33aa358d685ae2e1acbb1e0da62476de64e8 100644
+--- a/io/papermc/paper/threadedregions/RegionizedServer.java
++++ b/io/papermc/paper/threadedregions/RegionizedServer.java
+@@ -1,6 +1,5 @@
+ package io.papermc.paper.threadedregions;
+ 
+-import ca.spottedleaf.concurrentutil.collection.MultiThreadedQueue;
+ import ca.spottedleaf.concurrentutil.completable.Completable;
+ import ca.spottedleaf.concurrentutil.scheduler.SchedulerThreadPool;
+ import ca.spottedleaf.moonrise.common.util.TickThread;
+@@ -27,18 +26,30 @@ import java.util.List;
+ import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.function.BooleanSupplier;
++import java.util.ArrayDeque;
++import java.util.Objects;
++import io.papermc.paper.threadedregions.scheduling.SchedulingServices;
++import io.papermc.paper.threadedregions.scheduling.TaskLatencyTracker;
++import io.papermc.paper.threadedregions.scheduling.TaskType;
+ 
+ public final class RegionizedServer {
+ 
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private static final RegionizedServer INSTANCE = new RegionizedServer();
+ 
++    public enum GlobalTaskPriority {
++        CRITICAL,
++        HIGH,
++        NORMAL,
++        LOW
++    }
++
+     public final RegionizedTaskQueue taskQueue = new RegionizedTaskQueue();
+ 
+     private final CopyOnWriteArrayList<ServerLevel> worlds = new CopyOnWriteArrayList<>();
+     private final CopyOnWriteArrayList<Connection> connections = new CopyOnWriteArrayList<>();
+ 
+-    private final MultiThreadedQueue<Runnable> globalTickQueue = new MultiThreadedQueue<>();
++    private final GlobalTaskQueue globalTickQueue = new GlobalTaskQueue();
+ 
+     private final GlobalTickTickHandle tickHandle = new GlobalTickTickHandle(this);
+ 
+@@ -73,11 +84,19 @@ public final class RegionizedServer {
+     }
+ 
+     public void addTaskWithoutNotify(final Runnable run) {
+-        this.globalTickQueue.add(run);
++        this.addTaskWithoutNotify(run, GlobalTaskPriority.NORMAL);
++    }
++
++    public void addTaskWithoutNotify(final Runnable run, final GlobalTaskPriority priority) {
++        this.globalTickQueue.add(run, priority);
+     }
+ 
+     public void addTask(final Runnable run) {
+-        this.addTaskWithoutNotify(run);
++        this.addTask(run, GlobalTaskPriority.NORMAL);
++    }
++
++    public void addTask(final Runnable run, final GlobalTaskPriority priority) {
++        this.addTaskWithoutNotify(run, priority);
+         TickRegions.getScheduler().setHasTasks(this.tickHandle);
+     }
+ 
+@@ -166,7 +185,7 @@ public final class RegionizedServer {
+         }
+ 
+         private boolean runOneTask() {
+-            final Runnable run = this.server.globalTickQueue.poll();
++            final GlobalTaskQueue.GlobalTask run = this.server.globalTickQueue.poll();
+             if (run == null) {
+                 return false;
+             }
+@@ -466,4 +485,91 @@ public final class RegionizedServer {
+     public static final record WorldLevelData(ServerLevel world, long nonRedstoneGameTime, long dayTime) {
+ 
+     }
++    private static final class GlobalTaskQueue {
++
++        private static final SchedulingServices SCHEDULING_SERVICES = SchedulingServices.get();
++
++        @SuppressWarnings("unchecked")
++        private final ArrayDeque<GlobalTask>[] queues = (ArrayDeque<GlobalTask>[])new ArrayDeque[GlobalTaskPriority.values().length];
++
++        private GlobalTaskQueue() {
++            final GlobalTaskPriority[] priorities = GlobalTaskPriority.values();
++            for (int i = 0; i < priorities.length; ++i) {
++                this.queues[i] = new ArrayDeque<>();
++            }
++        }
++
++        public void add(final Runnable run, final GlobalTaskPriority priority) {
++            Objects.requireNonNull(run, "run");
++            Objects.requireNonNull(priority, "priority");
++            final long enqueueTime = System.nanoTime();
++            final TaskLatencyTracker.Ticket ticket = SCHEDULING_SERVICES.getLatencyTracker().recordEnqueue(TaskType.GLOBAL, enqueueTime);
++            final GlobalTask task = new GlobalTask(run, priority, enqueueTime, ticket);
++            synchronized (this) {
++                this.queues[priority.ordinal()].addLast(task);
++            }
++        }
++
++        public GlobalTask poll() {
++            synchronized (this) {
++                for (int i = 0; i < this.queues.length; ++i) {
++                    final ArrayDeque<GlobalTask> queue = this.queues[i];
++                    final GlobalTask task = queue.pollFirst();
++                    if (task != null) {
++                        return task;
++                    }
++                }
++            }
++            return null;
++        }
++
++        public boolean isEmpty() {
++            synchronized (this) {
++                for (final ArrayDeque<GlobalTask> queue : this.queues) {
++                    if (!queue.isEmpty()) {
++                        return false;
++                    }
++                }
++                return true;
++            }
++        }
++
++        public static final class GlobalTask implements Runnable {
++
++            private final Runnable run;
++            private final GlobalTaskPriority priority;
++            private final long enqueueNanoTime;
++            private final TaskLatencyTracker.Ticket ticket;
++
++            private GlobalTask(final Runnable run, final GlobalTaskPriority priority, final long enqueueNanoTime, final TaskLatencyTracker.Ticket ticket) {
++                this.run = run;
++                this.priority = priority;
++                this.enqueueNanoTime = enqueueNanoTime;
++                this.ticket = ticket;
++            }
++
++            @Override
++            public void run() {
++                try {
++                    this.run.run();
++                } finally {
++                    this.publishMetrics();
++                }
++            }
++
++            private void publishMetrics() {
++                try {
++                    if (this.ticket != null) {
++                        SCHEDULING_SERVICES.getLatencyTracker().recordExecution(this.ticket);
++                    }
++                    final long wait = Math.max(0L, System.nanoTime() - this.enqueueNanoTime);
++                    SCHEDULING_SERVICES.getMetricsCollector().recordExecution(0L, TaskType.GLOBAL, wait);
++                } catch (final Throwable throwable) {
++                    // Metrics collection failure should not interrupt task execution
++                    // Log but don't propagate
++                }
++            }
++
++        }
++    }
+ }
+\ No newline at end of file
+diff --git a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+index 25a0b1d56652e4455a188d0f413581638d5ef538..7d446ac3977382210d716fb9e239079a7c6e6462 100644
+--- a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
++++ b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+@@ -11,17 +11,25 @@ import ca.spottedleaf.moonrise.patches.chunk_system.ticket.ChunkSystemTicketType
+ import it.unimi.dsi.fastutil.longs.Long2ReferenceOpenHashMap;
+ import it.unimi.dsi.fastutil.objects.Reference2ReferenceMap;
+ import it.unimi.dsi.fastutil.objects.Reference2ReferenceOpenHashMap;
++import com.mojang.logging.LogUtils;
++import io.papermc.paper.threadedregions.scheduling.SchedulingServices;
++import io.papermc.paper.threadedregions.scheduling.TaskLatencyTracker;
++import io.papermc.paper.threadedregions.scheduling.TaskType;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.server.level.TicketType;
+-import net.minecraft.util.Unit;
+ import java.lang.invoke.VarHandle;
+ import java.util.ArrayDeque;
+ import java.util.Iterator;
+ import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.TimeUnit;
++import org.slf4j.Logger;
+ 
+ public final class RegionizedTaskQueue {
+ 
+-    private static final TicketType<Long> TASK_QUEUE_TICKET = ChunkSystemTicketType.create("task_queue_ticket", Long::compareTo);
++    private static final Logger LOGGER = LogUtils.getLogger();
++    @SuppressWarnings("unchecked")
++    private static final TicketType<Long> TASK_QUEUE_TICKET = (TicketType<Long>)ChunkSystemTicketType.create("task_queue_ticket", Long::compareTo);
++    private static final SchedulingServices SCHEDULING_SERVICES = SchedulingServices.get();
+ 
+     public PrioritisedExecutor.PrioritisedTask createChunkTask(final ServerLevel world, final int chunkX, final int chunkZ,
+                                                                final Runnable run) {
+@@ -71,6 +79,31 @@ public final class RegionizedTaskQueue {
+         return ret;
+     }
+ 
++    public boolean queueUrgentTask(final ServerLevel world, final int chunkX, final int chunkZ, final Runnable run) {
++        if (run == null) {
++            return false;
++        }
++        final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region =
++            world.regioniser.getRegionAtSynchronised(chunkX, chunkZ);
++        if (region == null) {
++            return false;
++        }
++        final TickRegions.TickRegionData data = region.getData();
++        if (data == null) {
++            return false;
++        }
++        final RegionTaskQueueData taskQueueData = data.getTaskQueueData();
++        if (taskQueueData == null) {
++            return false;
++        }
++        taskQueueData.queueUrgentTask(run, data.id);
++        data.setFairnessDebt(TickRegionScheduler.TIME_BETWEEN_TICKS / 2L);
++        SCHEDULING_SERVICES.getFairnessMonitor().resetRegion(data.id);
++        SCHEDULING_SERVICES.getFairnessScoreboard().clearRegion(data.id);
++        TickRegions.getScheduler().setHasTasks(data.getRegionSchedulingHandle());
++        return true;
++    }
++
+     public static final class WorldRegionTaskData {
+         private final ServerLevel world;
+         private final MultiThreadedQueue<Runnable> globalChunkTask = new MultiThreadedQueue<>();
+@@ -228,6 +261,8 @@ public final class RegionizedTaskQueue {
+         private final PrioritisedQueue tickTaskQueue = new PrioritisedQueue();
+         private final PrioritisedQueue chunkQueue = new PrioritisedQueue();
+         private final WorldRegionTaskData worldRegionTaskData;
++        private final MultiThreadedQueue<UrgentTask> urgentTasks = new MultiThreadedQueue<>();
++        private final AtomicLong urgentTaskCount = new AtomicLong();
+ 
+         public RegionTaskQueueData(final WorldRegionTaskData worldRegionTaskData) {
+             this.worldRegionTaskData = worldRegionTaskData;
+@@ -280,12 +315,56 @@ public final class RegionizedTaskQueue {
+         }
+ 
+         public boolean hasTasks() {
+-            return !this.tickTaskQueue.isEmpty() || !this.chunkQueue.isEmpty();
++            return !this.tickTaskQueue.isEmpty() || !this.chunkQueue.isEmpty() || this.urgentTaskCount.get() > 0L;
++        }
++
++        public void queueUrgentTask(final Runnable run, final long regionId) {
++            this.urgentTasks.add(new UrgentTask(run, regionId));
++            this.urgentTaskCount.incrementAndGet();
++        }
++
++        public boolean executeUrgentTask() {
++            final UrgentTask task = this.urgentTasks.poll();
++            if (task == null) {
++                return false;
++            }
++            task.execute();
++            this.urgentTaskCount.decrementAndGet();
++            return true;
++        }
++
++        private static final class UrgentTask {
++
++            private final Runnable run;
++            private final long regionId;
++            private final TaskLatencyTracker.Ticket ticket;
++            private final long enqueueNanoTime;
++
++            private UrgentTask(final Runnable run, final long regionId) {
++                this.run = run;
++                this.regionId = regionId;
++                this.enqueueNanoTime = System.nanoTime();
++                this.ticket = SCHEDULING_SERVICES.getLatencyTracker().recordEnqueue(TaskType.REGION, this.enqueueNanoTime);
++            }
++
++            private void execute() {
++                try {
++                    this.run.run();
++                } catch (final Throwable throwable) {
++                    LOGGER.error("Failed to execute urgent task for region {}", Long.valueOf(this.regionId), throwable);
++                } finally {
++                    SCHEDULING_SERVICES.getLatencyTracker().recordExecution(this.ticket);
++                    final long wait = Math.max(0L, System.nanoTime() - this.enqueueNanoTime);
++                    SCHEDULING_SERVICES.getFairnessMonitor().onTaskExecution(this.regionId, TaskType.REGION, wait);
++                }
++            }
+         }
+     }
+ 
+     static final class PrioritisedQueue {
+-        private final ArrayDeque<ChunkBasedPriorityTask>[] queues = new ArrayDeque[Priority.TOTAL_SCHEDULABLE_PRIORITIES]; {
++        @SuppressWarnings("unchecked")
++        private final ArrayDeque<ChunkBasedPriorityTask>[] queues = (ArrayDeque<ChunkBasedPriorityTask>[])new ArrayDeque[Priority.TOTAL_SCHEDULABLE_PRIORITIES];
++        {
+             for (int i = 0; i < Priority.TOTAL_SCHEDULABLE_PRIORITIES; ++i) {
+                 this.queues[i] = new ArrayDeque<>();
+             }
+@@ -371,7 +450,8 @@ public final class RegionizedTaskQueue {
+                         }
+ 
+                         split.computeIfAbsent(region, (keyInMap) -> {
+-                            final ArrayDeque<ChunkBasedPriorityTask>[] ret = new ArrayDeque[Priority.TOTAL_SCHEDULABLE_PRIORITIES];
++                            @SuppressWarnings("unchecked")
++                            final ArrayDeque<ChunkBasedPriorityTask>[] ret = (ArrayDeque<ChunkBasedPriorityTask>[])new ArrayDeque[Priority.TOTAL_SCHEDULABLE_PRIORITIES];
+ 
+                             for (int k = 0; k < ret.length; ++k) {
+                                 ret[k] = new ArrayDeque<>();
+@@ -418,6 +498,8 @@ public final class RegionizedTaskQueue {
+             final int max = Priority.IDLE.priority;
+             ChunkBasedPriorityTask task = null;
+             ReferenceCountData referenceCounter = null;
++            final long now = System.nanoTime();
++            
+             synchronized (this) {
+                 if (this.isDestroyed) {
+                     throw new IllegalStateException("Attempting to poll from dead queue");
+@@ -426,10 +508,51 @@ public final class RegionizedTaskQueue {
+                 search_loop:
+                 for (int i = 0; i <= max; ++i) {
+                     final ArrayDeque<ChunkBasedPriorityTask> queue = queues[i];
+-                    while ((task = queue.pollFirst()) != null) {
++                    final int queueSize = queue.size();
++                    
++                    for (int j = 0; j < queueSize; ++j) {
++                        task = queue.pollFirst();
++                        if (task == null) {
++                            break;
++                        }
++                        
++                        Priority dynamicPriority = null;
++                        if (task.latencyTicket != null && task.enqueueNanoTime > 0L) {
++                            final long waited = Math.max(0L, now - task.enqueueNanoTime);
++                            dynamicPriority = task.taskType == TaskType.IO ? Priority.HIGH : Priority.NORMAL;
++                            
++                            if (waited >= ChunkBasedPriorityTask.PRIORITY_HIGHEST_THRESHOLD_NS) {
++                                dynamicPriority = Priority.HIGHEST;
++                            } else if (waited >= ChunkBasedPriorityTask.PRIORITY_HIGHER_THRESHOLD_NS) {
++                                dynamicPriority = Priority.HIGHER;
++                            } else if (waited >= ChunkBasedPriorityTask.PRIORITY_BOOST_THRESHOLD_NS) {
++                                dynamicPriority = dynamicPriority == Priority.HIGH ? Priority.HIGHER : Priority.HIGH;
++                            }
++                        }
++                        
++                        final Priority currentPriority = task.getPriorityVolatile();
++                        if (currentPriority == null) {
++                            queue.addLast(task);
++                            task = null;
++                            continue;
++                        }
++                        
++                        if (dynamicPriority != null && dynamicPriority != currentPriority && 
++                            !currentPriority.isHigherOrEqualPriority(dynamicPriority)) {
++                            if (dynamicPriority.priority >= 0 && dynamicPriority.priority <= max && 
++                                task.setPriority(dynamicPriority)) {
++                                queues[dynamicPriority.priority].addLast(task);
++                                task = null;
++                                continue;
++                            }
++                        }
++                        
+                         if ((referenceCounter = task.trySetCompleting(i)) != null) {
+                             break search_loop;
+                         }
++                        
++                        queue.addLast(task);
++                        task = null;
+                     }
+                 }
+             }
+@@ -450,6 +573,10 @@ public final class RegionizedTaskQueue {
+         private static final class ChunkBasedPriorityTask implements PrioritisedExecutor.PrioritisedTask {
+ 
+             private static final ReferenceCountData REFERENCE_COUNTER_NOT_SET = new ReferenceCountData();
++            // Core scheduling thresholds: these define when tasks should be promoted based on wait time
++            static final long PRIORITY_BOOST_THRESHOLD_NS = TimeUnit.MILLISECONDS.toNanos(25L);
++            static final long PRIORITY_HIGHER_THRESHOLD_NS = TimeUnit.MILLISECONDS.toNanos(50L);
++            static final long PRIORITY_HIGHEST_THRESHOLD_NS = TimeUnit.MILLISECONDS.toNanos(100L);
+             static {
+                 REFERENCE_COUNTER_NOT_SET.referenceCount.set((long)Integer.MIN_VALUE);
+             }
+@@ -459,10 +586,16 @@ public final class RegionizedTaskQueue {
+             private final int chunkZ;
+             private final long sectionLowerLeftCoord; // chunk coordinate
+             private final boolean isChunkTask;
++            private final TaskType taskType;
++
++            private TaskLatencyTracker.Ticket latencyTicket;
++            private long enqueueNanoTime;
+ 
++            @SuppressWarnings("unused")
+             private volatile ReferenceCountData referenceCounter;
+             private static final VarHandle REFERENCE_COUNTER_HANDLE = ConcurrentUtil.getVarHandle(ChunkBasedPriorityTask.class, "referenceCounter", ReferenceCountData.class);
+             private Runnable run;
++            @SuppressWarnings("unused")
+             private volatile Priority priority;
+             private static final VarHandle PRIORITY_HANDLE = ConcurrentUtil.getVarHandle(ChunkBasedPriorityTask.class, "priority", Priority.class);
+ 
+@@ -475,6 +608,7 @@ public final class RegionizedTaskQueue {
+                 this.run = run;
+                 this.setReferenceCounterPlain(REFERENCE_COUNTER_NOT_SET);
+                 this.setPriorityPlain(priority);
++                this.taskType = isChunkTask ? TaskType.IO : TaskType.ENTITY;
+ 
+                 final int regionShift = world.world.regioniser.sectionChunkShift;
+                 final int regionMask = (1 << regionShift) - 1;
+@@ -514,12 +648,41 @@ public final class RegionizedTaskQueue {
+                 try {
+                     this.run.run();
+                 } finally {
++                    this.publishExecutionMetrics();
+                     this.run = null;
+                 }
+             }
+ 
+             private void cancelInternal() {
+                 this.run = null;
++                this.latencyTicket = null;
++            }
++
++            private void publishExecutionMetrics() {
++                final TaskLatencyTracker.Ticket ticket = this.latencyTicket;
++                if (ticket == null) {
++                    return;
++                }
++                this.latencyTicket = null;
++                try {
++                    SCHEDULING_SERVICES.getLatencyTracker().recordExecution(ticket);
++                    final long wait = Math.max(0L, System.nanoTime() - this.enqueueNanoTime);
++                    final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region = TickRegionScheduler.getCurrentRegion();
++                    final long regionId;
++                    if (region != null) {
++                        final TickRegions.TickRegionData data = region.getData();
++                        regionId = data != null ? data.id : 0L;
++                    } else {
++                        regionId = 0L;
++                    }
++                    if (this.taskType.isRegionBound()) {
++                        SCHEDULING_SERVICES.getFairnessMonitor().onTaskExecution(regionId, this.taskType, wait);
++                    } else {
++                        SCHEDULING_SERVICES.getMetricsCollector().recordExecution(regionId, this.taskType, wait);
++                    }
++                } catch (final Throwable throwable) {
++                    LOGGER.error("Failed to publish execution metrics for task type {}", this.taskType, throwable);
++                }
+             }
+ 
+             private boolean tryComplete(final boolean cancel) {
+@@ -580,6 +743,8 @@ public final class RegionizedTaskQueue {
+                     return false;
+                 }
+ 
++                this.prepareEnqueueMetrics();
++
+                 boolean synchronise = false;
+                 for (;;) {
+                     // we need to synchronise for repeated operations so that we guarantee that we do not retrieve
+@@ -597,6 +762,7 @@ public final class RegionizedTaskQueue {
+                         if (this.getReferenceCounterVolatile() != null) {
+                             throw new IllegalStateException("Expected null ref count when queue does not exist");
+                         }
++                    this.latencyTicket = null;
+                         // the task never could be polled from the queue, so we return false
+                         // don't decrement reference count, as we were certainly cancelled by another thread, which
+                         // will decrement the reference count
+@@ -610,6 +776,7 @@ public final class RegionizedTaskQueue {
+                         // we were cancelled
+                         // don't decrement reference count, as we were certainly cancelled by another thread, which
+                         // will decrement the reference count
++                        this.latencyTicket = null;
+                         return false;
+                     }
+ 
+@@ -705,6 +872,52 @@ public final class RegionizedTaskQueue {
+                 return this.getPriorityVolatile();
+             }
+ 
++            private void prepareEnqueueMetrics() {
++                this.enqueueNanoTime = System.nanoTime();
++                if (this.latencyTicket == null) {
++                    this.latencyTicket = SCHEDULING_SERVICES.getLatencyTracker().recordEnqueue(this.taskType, this.enqueueNanoTime);
++                }
++            }
++
++            private boolean applyDynamicPriority(final long now, final int currentPriorityIndex) {
++                if (this.latencyTicket == null) {
++                    return false;
++                }
++                final long waited = Math.max(0L, now - this.enqueueNanoTime);
++                final Priority target = this.computeDynamicPriority(waited);
++                if (target == null) {
++                    return false;
++                }
++                final Priority curr = this.getPriorityVolatile();
++                if (curr == target || curr.isHigherOrEqualPriority(target)) {
++                    return false;
++                }
++                if (this.setPriority(target)) {
++                    return this.getPriorityVolatile().priority != currentPriorityIndex;
++                }
++                return false;
++            }
++
++            private Priority computeDynamicPriority(final long waitedNanos) {
++                // base priority by task type
++                Priority target = switch (this.taskType) {
++                    case IO -> Priority.HIGH;
++                    case ENTITY -> Priority.NORMAL;
++                    case REGION -> Priority.NORMAL;
++                    default -> Priority.NORMAL;
++                };
++
++                if (waitedNanos >= PRIORITY_HIGHEST_THRESHOLD_NS) {
++                    target = Priority.HIGHEST;
++                } else if (waitedNanos >= PRIORITY_HIGHER_THRESHOLD_NS) {
++                    target = Priority.HIGHER;
++                } else if (waitedNanos >= PRIORITY_BOOST_THRESHOLD_NS) {
++                    target = target == Priority.HIGH ? Priority.HIGHER : Priority.HIGH;
++                }
++
++                return target;
++            }
++
+             @Override
+             public boolean lowerPriority(final Priority priority) {
+                 int failures = 0;
+diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
+index fa6b8d756195c1b430cc11214a901bd42eebc98d..174fac52ab1ad40a4033b30984b9bc47168d53f6 100644
+--- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
++++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
+@@ -4,6 +4,10 @@ import ca.spottedleaf.concurrentutil.scheduler.SchedulerThreadPool;
+ import ca.spottedleaf.concurrentutil.util.TimeUtil;
+ import ca.spottedleaf.moonrise.common.util.TickThread;
+ import com.mojang.logging.LogUtils;
++import io.papermc.paper.threadedregions.monitoring.FairnessMonitor;
++import io.papermc.paper.threadedregions.monitoring.SchedulerMetricsCollector;
++import io.papermc.paper.threadedregions.scheduling.SchedulingServices;
++import io.papermc.paper.threadedregions.scheduling.TaskType;
+ import io.papermc.paper.util.TraceUtil;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.level.ServerLevel;
+@@ -42,6 +46,9 @@ public final class TickRegionScheduler {
+     // Folia end - watchdog
+ 
+     private final SchedulerThreadPool scheduler;
++    private final SchedulingServices schedulingServices;
++    private final FairnessMonitor fairnessMonitor;
++    private final SchedulerMetricsCollector metricsCollector;
+ 
+     public TickRegionScheduler(final int threads) {
+         this.scheduler = new SchedulerThreadPool(threads, new ThreadFactory() {
+@@ -54,6 +61,9 @@ public final class TickRegionScheduler {
+                 return ret;
+             }
+         });
++        this.schedulingServices = SchedulingServices.get();
++        this.fairnessMonitor = this.schedulingServices.getFairnessMonitor();
++        this.metricsCollector = this.schedulingServices.getMetricsCollector();
+     }
+ 
+     public int getTotalThreadCount() {
+@@ -191,6 +201,39 @@ public final class TickRegionScheduler {
+         this.scheduler.notifyTasks(region);
+     }
+ 
++    private void recordExecutionMetrics(final RegionScheduleHandle handle, final long scheduledStart, final long startNanoTime, final boolean tickExecution) {
++        try {
++            final long wait;
++            if (scheduledStart == SchedulerThreadPool.DEADLINE_NOT_SET) {
++                wait = 0L;
++            } else {
++                wait = Math.max(0L, startNanoTime - scheduledStart);
++            }
++            final long regionId = handle.region == null ? 0L : handle.region.id;
++            final TaskType type;
++            if (handle.region == null) {
++                type = TaskType.GLOBAL;
++            } else if (tickExecution) {
++                type = TaskType.REGION;
++            } else {
++                type = TaskType.ENTITY;
++            }
++
++            if (!tickExecution && handle.region != null) {
++                return;
++            }
++
++            if (type.isRegionBound()) {
++                this.fairnessMonitor.onTaskExecution(regionId, type, wait);
++            } else {
++                this.metricsCollector.recordExecution(regionId, type, wait);
++            }
++        } catch (final Throwable throwable) {
++            // Metrics collection failure should not interrupt scheduling
++            // Log but don't propagate
++        }
++    }
++
+     public void init() {
+         this.scheduler.start();
+     }
+@@ -256,6 +299,8 @@ public final class TickRegionScheduler {
+ 
+         private TickRegionScheduler scheduler;
+ 
++        private long fairnessDebtNanos;
++
+         public RegionScheduleHandle(final TickRegions.TickRegionData region, final long firstStart) {
+             this.currentTick = 0L;
+             this.lastTickStart = SchedulerThreadPool.DEADLINE_NOT_SET;
+@@ -311,6 +356,8 @@ public final class TickRegionScheduler {
+             final long cpuStart = MEASURE_CPU_TIME ? THREAD_MX_BEAN.getCurrentThreadCpuTime() : 0L;
+             final long tickStart = System.nanoTime();
+ 
++            final long scheduledStart = this.getScheduledStart();
++
+             if (!this.tryMarkTicking()) {
+                 if (!this.cancelled.get()) {
+                     throw new IllegalStateException("Scheduled region should be acquirable");
+@@ -361,6 +408,10 @@ public final class TickRegionScheduler {
+                 }
+             }
+ 
++            final TickRegionScheduler scheduler = this.scheduler;
++            if (scheduler != null) {
++                scheduler.recordExecutionMetrics(this, scheduledStart, tickStart, false);
++            }
+             return !this.markNotTicking() || this.cancelled.get() ? null : Boolean.valueOf(ret);
+         }
+ 
+@@ -401,6 +452,8 @@ public final class TickRegionScheduler {
+ 
+             final long scheduledStart = this.getScheduledStart();
+             final long scheduledEnd = scheduledStart + TIME_BETWEEN_TICKS;
++            final long waitForTick = scheduledStart == SchedulerThreadPool.DEADLINE_NOT_SET ? 0L : Math.max(0L, tickStart - scheduledStart);
++            this.accumulateFairnessDebt(waitForTick);
+ 
+             synchronized (this) {
+                 this.currentTickData = new TickTime(
+@@ -425,11 +478,37 @@ public final class TickRegionScheduler {
+                 final long tickEnd = System.nanoTime();
+                 final long cpuEnd = MEASURE_CPU_TIME ? THREAD_MX_BEAN.getCurrentThreadCpuTime() : 0L;
+ 
+-                // in order to ensure all regions get their chance at scheduling, we have to ensure that regions
+-                // that exceed the max tick time are not always prioritised over everything else. Thus, we use the greatest
+-                // of the current time and "ideal" next tick start.
+                 this.tickSchedule.advanceBy(tickCount, TIME_BETWEEN_TICKS);
+-                this.setScheduledStart(TimeUtil.getGreatestTime(tickEnd, this.tickSchedule.getDeadline(TIME_BETWEEN_TICKS)));
++                long deadline = this.tickSchedule.getDeadline(TIME_BETWEEN_TICKS);
++                
++                if (deadline == SchedulerThreadPool.DEADLINE_NOT_SET) {
++                    deadline = tickEnd;
++                } else {
++                    final long fairnessAdjustment = this.takeFairnessAdjustment();
++                    if (fairnessAdjustment > 0L) {
++                        final long adjusted = deadline - fairnessAdjustment;
++                        if (adjusted <= 0L) {
++                            deadline = 0L;
++                            this.fairnessDebtNanos = 0L;
++                        } else {
++                            deadline = adjusted;
++                        }
++                    }
++                    
++                    if (this.scheduler != null && this.scheduler.fairnessMonitor != null && this.region != null) {
++                        try {
++                            final FairnessMonitor.RegionState state = this.scheduler.fairnessMonitor.snapshotRegion(this.region.id);
++                            if (state != null && state.consecutiveBreaches() > 0 && state.lastObservedWait() > TIME_BETWEEN_TICKS * 2L) {
++                                final long starvationAdjustment = Math.min(TIME_BETWEEN_TICKS >>> 2, deadline);
++                                deadline = Math.max(0L, deadline - starvationAdjustment);
++                            }
++                        } catch (final Throwable throwable) {
++                            // Monitor failure should not break deadline calculation
++                        }
++                    }
++                }
++                
++                this.setScheduledStart(TimeUtil.getGreatestTime(tickEnd, deadline));
+ 
+                 final TickTime time = new TickTime(
+                     lastTickStart, scheduledStart, tickStart, cpuStart, tickEnd, cpuEnd, MEASURE_CPU_TIME, true
+@@ -442,6 +521,20 @@ public final class TickRegionScheduler {
+                 }
+             }
+ 
++            final TickRegionScheduler scheduler = this.scheduler;
++            if (scheduler != null) {
++                scheduler.recordExecutionMetrics(this, scheduledStart, tickStart, true);
++                
++                if (this.region != null && this.currentTick > 0L && (this.currentTick % 100L == 0L)) {
++                    if (scheduler.schedulingServices != null) {
++                        try {
++                            scheduler.schedulingServices.getAdaptiveLoadBalancer().assessSystemLoad();
++                        } catch (final Throwable throwable) {
++                            // Load assessment failure should not interrupt scheduling
++                        }
++                    }
++                }
++            }
+             // Only AFTER updating the tickStart
+             return this.markNotTicking() && !this.cancelled.get();
+         }
+@@ -524,6 +617,64 @@ public final class TickRegionScheduler {
+         protected final void setCurrentTick(final long value) {
+             this.currentTick = value;
+         }
++
++        private void accumulateFairnessDebt(final long waitNanoseconds) {
++            if (this.region == null || waitNanoseconds <= 0L) {
++                return;
++            }
++            
++            long debt = this.fairnessDebtNanos + (waitNanoseconds >>> 1);
++            
++            final TickRegionScheduler scheduler = this.scheduler;
++            if (scheduler != null && scheduler.fairnessMonitor != null && this.region != null) {
++                try {
++                    final FairnessMonitor.RegionState state = scheduler.fairnessMonitor.snapshotRegion(this.region.id);
++                    if (state != null && state.consecutiveBreaches() > 0) {
++                        final long starvationBonus = Math.min(waitNanoseconds >>> 2, TIME_BETWEEN_TICKS >>> 2);
++                        debt += starvationBonus;
++                    }
++                } catch (final Throwable throwable) {
++                    // Monitor failure should not break debt accumulation
++                }
++            }
++            
++            this.fairnessDebtNanos = Math.min(TIME_BETWEEN_TICKS, debt);
++        }
++
++        private long takeFairnessAdjustment() {
++            if (this.region == null) {
++                return 0L;
++            }
++            
++            long adjustment = Math.min(this.fairnessDebtNanos, TIME_BETWEEN_TICKS >>> 1);
++            
++            final TickRegionScheduler scheduler = this.scheduler;
++            if (scheduler != null && scheduler.fairnessMonitor != null && this.region != null) {
++                try {
++                    final FairnessMonitor.RegionState state = scheduler.fairnessMonitor.snapshotRegion(this.region.id);
++                    if (state != null && state.consecutiveBreaches() > 0 && state.lastObservedWait() > TIME_BETWEEN_TICKS) {
++                        adjustment = Math.min(this.fairnessDebtNanos, TIME_BETWEEN_TICKS * 3L / 4L);
++                    }
++                } catch (final Throwable throwable) {
++                    // Monitor failure should not break adjustment calculation
++                }
++            }
++            
++            this.fairnessDebtNanos = Math.max(0L, this.fairnessDebtNanos - adjustment);
++            return adjustment;
++        }
++
++        void setFairnessDebtNanos(final long debt) {
++            if (debt <= 0L) {
++                this.fairnessDebtNanos = 0L;
++            } else {
++                this.fairnessDebtNanos = Math.min(TIME_BETWEEN_TICKS, debt);
++            }
++        }
++
++        long getFairnessDebtNanos() {
++            return Math.max(0L, Math.min(this.fairnessDebtNanos, TIME_BETWEEN_TICKS));
++        }
+     }
+ 
+     // All time units are in nanoseconds.
+diff --git a/io/papermc/paper/threadedregions/TickRegions.java b/io/papermc/paper/threadedregions/TickRegions.java
+index 988fe74578065c9464f5639e5cc6af79619edef5..520d2096967d04b9f8256394971ad2cf2ba5c640 100644
+--- a/io/papermc/paper/threadedregions/TickRegions.java
++++ b/io/papermc/paper/threadedregions/TickRegions.java
+@@ -13,11 +13,14 @@ import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.level.ServerLevel;
+ import org.slf4j.Logger;
++import java.util.ArrayList;
+ import java.util.Iterator;
++import java.util.List;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.function.BooleanSupplier;
++import io.papermc.paper.threadedregions.scheduling.SchedulingServices;
+ 
+ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> {
+ 
+@@ -199,6 +202,14 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+             return this.taskQueueData;
+         }
+ 
++        public void setFairnessDebt(final long debt) {
++            this.tickHandle.setFairnessDebtNanos(debt);
++        }
++
++        public long getFairnessDebt() {
++            return this.tickHandle.getFairnessDebtNanos();
++        }
++
+         // the value returned can be invalidated at any time, except when the caller
+         // is ticking this region
+         public TickRegionScheduler.RegionScheduleHandle getRegionSchedulingHandle() {
+@@ -295,6 +306,12 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+ 
+             // task queue
+             this.taskQueueData.split(regioniser, into);
++
++            final List<TickRegionData> childData = new ArrayList<>(regions.size());
++            for (final ThreadedRegionizer.ThreadedRegion<TickRegionData, TickRegionSectionData> region : regions) {
++                childData.add(region.getData());
++            }
++            SchedulingServices.get().getAdaptiveLoadBalancer().onRegionSplit(this, childData);
+         }
+ 
+         @Override
+@@ -327,6 +344,8 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+ 
+             // task queue
+             this.taskQueueData.mergeInto(data.taskQueueData);
++
++            SchedulingServices.get().getAdaptiveLoadBalancer().onRegionMerge(this, data);
+         }
+     }
+ 
+@@ -418,14 +437,26 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+ 
+             boolean executeChunkTask = true;
+             boolean executeTickTask = true;
+-            do {
++            while (canContinue.getAsBoolean()) {
++                if (queue.executeUrgentTask()) {
++                    continue;
++                }
++                boolean ranTask = false;
+                 if (executeTickTask) {
+-                    executeTickTask = queue.executeTickTask();
++                    final boolean tickRan = queue.executeTickTask();
++                    executeTickTask = tickRan;
++                    ranTask |= tickRan;
+                 }
+                 if (executeChunkTask) {
+-                    processedChunkTask |= (executeChunkTask = queue.executeChunkTask());
++                    final boolean chunkRan = queue.executeChunkTask();
++                    processedChunkTask |= chunkRan;
++                    executeChunkTask = chunkRan;
++                    ranTask |= chunkRan;
+                 }
+-            } while ((executeChunkTask | executeTickTask) && canContinue.getAsBoolean());
++                if (!ranTask) {
++                    break;
++                }
++            }
+ 
+             if (processedChunkTask) {
+                 // if we processed any chunk tasks, try to process ticket level updates for full status changes
+diff --git a/io/papermc/paper/threadedregions/commands/CommandServerHealth.java b/io/papermc/paper/threadedregions/commands/CommandServerHealth.java
+index 5e6b490ee58a90fd7c02fa09093830c0d9c67f6b..f3123ddf3a5c8cec2fb35cc897c38e4e8fffe49d 100644
+--- a/io/papermc/paper/threadedregions/commands/CommandServerHealth.java
++++ b/io/papermc/paper/threadedregions/commands/CommandServerHealth.java
+@@ -1,12 +1,18 @@
+ package io.papermc.paper.threadedregions.commands;
+ 
++import com.mojang.logging.LogUtils;
+ import io.papermc.paper.threadedregions.RegionizedServer;
+-import io.papermc.paper.threadedregions.RegionizedWorldData;
+ import io.papermc.paper.threadedregions.ThreadedRegionizer;
+ import io.papermc.paper.threadedregions.TickData;
+ import io.papermc.paper.threadedregions.TickRegionScheduler;
+ import io.papermc.paper.threadedregions.TickRegions;
++import io.papermc.paper.threadedregions.monitoring.SchedulerMetricsCollector;
++import io.papermc.paper.threadedregions.scheduling.FairnessScoreboard;
++import io.papermc.paper.threadedregions.scheduling.SchedulingServices;
++import io.papermc.paper.threadedregions.scheduling.TaskLatencyTracker;
++import io.papermc.paper.threadedregions.scheduling.TaskType;
+ import it.unimi.dsi.fastutil.doubles.DoubleArrayList;
++import it.unimi.dsi.fastutil.longs.Long2ReferenceOpenHashMap;
+ import it.unimi.dsi.fastutil.objects.ObjectObjectImmutablePair;
+ import net.kyori.adventure.text.Component;
+ import net.kyori.adventure.text.TextComponent;
+@@ -24,14 +30,19 @@ import org.bukkit.command.CommandSender;
+ import org.bukkit.craftbukkit.CraftWorld;
+ import org.bukkit.entity.Entity;
+ import org.bukkit.entity.Player;
++import org.slf4j.Logger;
+ import java.text.DecimalFormat;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Comparator;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Map;
+ 
+ public final class CommandServerHealth extends Command {
+ 
++    private static final Logger LOGGER = LogUtils.getLogger();
++
+     private static final ThreadLocal<DecimalFormat> TWO_DECIMAL_PLACES = ThreadLocal.withInitial(() -> {
+         return new DecimalFormat("#,##0.00");
+     });
+@@ -47,6 +58,7 @@ public final class CommandServerHealth extends Command {
+     private static final TextColor SECONDARY = TextColor.color(104, 177, 240);
+     private static final TextColor INFORMATION = TextColor.color(145, 198, 243);
+     private static final TextColor LIST = TextColor.color(33, 97, 188);
++    private static final double NANOS_TO_MILLIS = 1.0E-6;
+ 
+     public CommandServerHealth() {
+         super("tps");
+@@ -79,6 +91,42 @@ public final class CommandServerHealth extends Command {
+             .build();
+     }
+ 
++    private static Component formatFairnessEntry(final FairnessScoreboard.FairnessSnapshot snapshot,
++                                                 final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region,
++                                                 final boolean newline) {
++        final TextComponent.Builder builder = Component.text();
++        builder.append(Component.text(" - ", LIST, TextDecoration.BOLD));
++        builder.append(Component.text("Region #" + snapshot.regionId(), PRIMARY));
++        if (region != null) {
++            final ChunkPos center = region.getCenterChunk();
++            if (center != null) {
++                builder.append(Component.text(" @ ", PRIMARY));
++                builder.append(Component.text(center.x + ", " + center.z, INFORMATION));
++            }
++            builder.append(Component.text(" [" + region.regioniser.world.getWorld().getName() + "]", INFORMATION));
++        }
++        builder.append(Component.text("\n", PRIMARY));
++
++        final double avgMs = snapshot.averageWait() * NANOS_TO_MILLIS;
++        final double maxMs = snapshot.maxWait() * NANOS_TO_MILLIS;
++        final double lastMs = snapshot.lastObservedWait() * NANOS_TO_MILLIS;
++
++        builder.append(Component.text("    Avg wait: ", PRIMARY))
++            .append(Component.text(TWO_DECIMAL_PLACES.get().format(avgMs) + " ms", INFORMATION))
++            .append(Component.text(" / Max: ", PRIMARY))
++            .append(Component.text(TWO_DECIMAL_PLACES.get().format(maxMs) + " ms", INFORMATION))
++            .append(Component.text(" / Last: ", PRIMARY))
++            .append(Component.text(TWO_DECIMAL_PLACES.get().format(lastMs) + " ms", INFORMATION))
++            .append(Component.text("\n", PRIMARY));
++
++        builder.append(Component.text("    Executions: ", PRIMARY))
++            .append(Component.text(NO_DECIMAL_PLACES.get().format(snapshot.executions()), INFORMATION))
++            .append(Component.text(" / Starvation alerts: ", PRIMARY))
++            .append(Component.text(NO_DECIMAL_PLACES.get().format(snapshot.starvationWarnings()) + (newline ? "\n" : ""), INFORMATION));
++
++        return builder.build();
++    }
++
+     private static boolean executeRegion(final CommandSender sender, final String commandLabel, final String[] args) {
+         final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region =
+             TickRegionScheduler.getCurrentRegion();
+@@ -145,12 +193,17 @@ public final class CommandServerHealth extends Command {
+ 
+         final List<ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData>> regions =
+             new ArrayList<>();
++        final Long2ReferenceOpenHashMap<ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData>> regionsById = new Long2ReferenceOpenHashMap<>();
+ 
+         for (final World bukkitWorld : Bukkit.getWorlds()) {
+             final ServerLevel world = ((CraftWorld)bukkitWorld).getHandle();
+             world.regioniser.computeForAllRegions(regions::add);
+         }
+ 
++        for (final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region : regions) {
++            regionsById.put(region.getData().id, region);
++        }
++
+         final double minTps;
+         final double medianTps;
+         final double maxTps;
+@@ -268,6 +321,60 @@ public final class CommandServerHealth extends Command {
+             lowestRegionsBuilder.append(line);
+         }
+ 
++        final SchedulerMetricsCollector.SchedulerMetricsSnapshot metricsSnapshot;
++        try {
++            metricsSnapshot = SchedulingServices.get().getMetricsCollector().snapshot();
++        } catch (final Throwable throwable) {
++            LOGGER.error("Failed to snapshot scheduler metrics", throwable);
++            return true;
++        }
++        final TaskLatencyTracker.LatencyMetrics globalLatency = metricsSnapshot == null ? null : metricsSnapshot.latencyMetrics().get(TaskType.GLOBAL);
++
++        final TextComponent.Builder fairnessBuilder = Component.text();
++        fairnessBuilder.append(Component.text("Fairness & Wait Stats\n", HEADER, TextDecoration.BOLD));
++
++        if (globalLatency != null && globalLatency != TaskLatencyTracker.LatencyMetrics.EMPTY && globalLatency.taskCount() > 0L) {
++            fairnessBuilder.append(Component.text(" - ", LIST, TextDecoration.BOLD))
++                .append(Component.text("Global queue avg wait: ", PRIMARY))
++                .append(Component.text(TWO_DECIMAL_PLACES.get().format(globalLatency.averageWait() * NANOS_TO_MILLIS) + " ms", INFORMATION))
++                .append(Component.text(" / max: ", PRIMARY))
++                .append(Component.text(TWO_DECIMAL_PLACES.get().format(globalLatency.maxWait() * NANOS_TO_MILLIS) + " ms\n", INFORMATION));
++        } else {
++            fairnessBuilder.append(Component.text(" - ", LIST, TextDecoration.BOLD))
++                .append(Component.text("Global queue avg wait: ", PRIMARY))
++                .append(Component.text("no samples\n", INFORMATION));
++        }
++
++        final List<FairnessScoreboard.FairnessSnapshot> fairnessHotspots;
++        try {
++            fairnessHotspots = new ArrayList<>(metricsSnapshot != null && metricsSnapshot.regionFairness() != null ? metricsSnapshot.regionFairness().values() : java.util.Collections.emptyList());
++        } catch (final Throwable throwable) {
++            LOGGER.error("Failed to collect fairness hotspots", throwable);
++            return true;
++        }
++        fairnessHotspots.sort(Comparator
++            .comparingLong(FairnessScoreboard.FairnessSnapshot::starvationWarnings)
++            .thenComparingDouble(FairnessScoreboard.FairnessSnapshot::averageWait)
++            .reversed());
++
++        int appendedFairness = 0;
++        for (int i = 0, len = fairnessHotspots.size(); i < len && appendedFairness < lowestRegionsCount; ++i) {
++            final FairnessScoreboard.FairnessSnapshot snapshot = fairnessHotspots.get(i);
++            if (snapshot.starvationWarnings() == 0L && snapshot.averageWait() <= 0.0D) {
++                // skip low signal entries
++                continue;
++            }
++            fairnessBuilder.append(
++                formatFairnessEntry(snapshot, regionsById.get(snapshot.regionId()), appendedFairness + 1 != lowestRegionsCount)
++            );
++            ++appendedFairness;
++        }
++
++        if (appendedFairness == 0) {
++            fairnessBuilder.append(Component.text(" - ", LIST, TextDecoration.BOLD))
++                .append(Component.text("No active starvation alerts\n", INFORMATION));
++        }
++
+         sender.sendMessage(
+             Component.text()
+                 .append(Component.text("Server Health Report\n", HEADER, TextDecoration.BOLD))
+@@ -311,6 +418,8 @@ public final class CommandServerHealth extends Command {
+                 .append(Component.text(" utilisation regions\n", HEADER, TextDecoration.BOLD))
+ 
+                 .append(lowestRegionsBuilder.build())
++                .append(Component.text("\n", PRIMARY))
++                .append(fairnessBuilder.build())
+                 .build()
+         );
+ 
+diff --git a/io/papermc/paper/threadedregions/monitoring/FairnessMonitor.java b/io/papermc/paper/threadedregions/monitoring/FairnessMonitor.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..014f274f6500aad346ec6db5ac0a952783e7a195
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/monitoring/FairnessMonitor.java
+@@ -0,0 +1,90 @@
++package io.papermc.paper.threadedregions.monitoring;
++
++import io.papermc.paper.threadedregions.scheduling.TaskType;
++
++import java.util.Objects;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicLong;
++
++public final class FairnessMonitor {
++
++    private final SchedulerMetricsCollector collector;
++    private final ConcurrentMap<Long, RegionFairnessState> regionStates = new ConcurrentHashMap<>();
++    private volatile long starvationThresholdNanos;
++    private volatile int starvationWarningLimit;
++
++    public FairnessMonitor(final SchedulerMetricsCollector collector, final long starvationThresholdNanos, final int starvationWarningLimit) {
++        this.collector = Objects.requireNonNull(collector, "collector");
++        this.starvationThresholdNanos = Math.max(starvationThresholdNanos, 0L);
++        this.starvationWarningLimit = Math.max(starvationWarningLimit, 1);
++    }
++
++    public void setStarvationThresholdNanos(final long starvationThresholdNanos) {
++        this.starvationThresholdNanos = Math.max(starvationThresholdNanos, 0L);
++    }
++
++    public void setStarvationWarningLimit(final int starvationWarningLimit) {
++        this.starvationWarningLimit = Math.max(starvationWarningLimit, 1);
++    }
++
++    public SchedulerMetricsCollector getCollector() {
++        return this.collector;
++    }
++
++    public void onTaskExecution(final long regionId, final TaskType type, final long waitNanoseconds) {
++        this.collector.recordExecution(regionId, type, waitNanoseconds);
++        if (!type.isRegionBound()) {
++            return;
++        }
++        final long threshold = this.starvationThresholdNanos;
++        if (waitNanoseconds < threshold) {
++            this.resetRegion(regionId);
++            return;
++        }
++
++        final RegionFairnessState state = this.regionStates.computeIfAbsent(regionId, RegionFairnessState::new);
++        final int current = state.consecutiveBreaches.incrementAndGet();
++        state.lastObservedWait.set(waitNanoseconds);
++        if (current >= this.starvationWarningLimit) {
++            state.consecutiveBreaches.set(0);
++            this.collector.notifyStarvation(regionId, waitNanoseconds);
++            state.lastAlertTime.set(System.nanoTime());
++        }
++    }
++
++    public void resetRegion(final long regionId) {
++        final RegionFairnessState state = this.regionStates.get(regionId);
++        if (state != null) {
++            state.consecutiveBreaches.set(0);
++            state.lastObservedWait.set(0L);
++        }
++    }
++
++    public RegionState snapshotRegion(final long regionId) {
++        final RegionFairnessState state = this.regionStates.get(regionId);
++        if (state == null) {
++            return RegionState.EMPTY;
++        }
++        return new RegionState(state.regionId, state.consecutiveBreaches.get(), state.lastObservedWait.get(), state.lastAlertTime.get());
++    }
++
++    private static final class RegionFairnessState {
++
++        @SuppressWarnings("unused")
++        private final long regionId;
++        private final AtomicInteger consecutiveBreaches = new AtomicInteger();
++        private final AtomicLong lastObservedWait = new AtomicLong();
++        private final AtomicLong lastAlertTime = new AtomicLong();
++
++        private RegionFairnessState(final long regionId) {
++            this.regionId = regionId;
++        }
++    }
++
++    public record RegionState(long regionId, int consecutiveBreaches, long lastObservedWait, long lastAlertTime) {
++        public static final RegionState EMPTY = new RegionState(-1L, 0, 0L, 0L);
++    }
++}
++
+diff --git a/io/papermc/paper/threadedregions/monitoring/SchedulerMetricsCollector.java b/io/papermc/paper/threadedregions/monitoring/SchedulerMetricsCollector.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c97ce552f63ab6b2506cee5aeb77a7acdcb6452
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/monitoring/SchedulerMetricsCollector.java
+@@ -0,0 +1,70 @@
++package io.papermc.paper.threadedregions.monitoring;
++
++import io.papermc.paper.threadedregions.scheduling.FairnessScoreboard;
++import io.papermc.paper.threadedregions.scheduling.TaskLatencyTracker;
++import io.papermc.paper.threadedregions.scheduling.TaskType;
++
++import java.time.Instant;
++import java.util.ArrayList;
++import java.util.EnumMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.atomic.AtomicLong;
++
++public final class SchedulerMetricsCollector {
++
++    private final FairnessScoreboard fairnessScoreboard;
++    private final TaskLatencyTracker latencyTracker;
++    private final ConcurrentLinkedQueue<FairnessAlert> fairnessAlerts = new ConcurrentLinkedQueue<>();
++    private final AtomicLong lastSnapshotTime = new AtomicLong();
++
++    public SchedulerMetricsCollector(final FairnessScoreboard fairnessScoreboard, final TaskLatencyTracker latencyTracker) {
++        this.fairnessScoreboard = Objects.requireNonNull(fairnessScoreboard, "fairnessScoreboard");
++        this.latencyTracker = Objects.requireNonNull(latencyTracker, "latencyTracker");
++    }
++
++    public void recordExecution(final long regionId, final TaskType type, final long waitNanoseconds) {
++        this.fairnessScoreboard.recordExecution(regionId, type, waitNanoseconds);
++        this.latencyTracker.recordWait(type, waitNanoseconds);
++    }
++
++    public void notifyStarvation(final long regionId, final long observedWaitNanoseconds) {
++        this.fairnessScoreboard.recordStarvationWarning(regionId);
++        this.fairnessAlerts.add(new FairnessAlert(regionId, observedWaitNanoseconds, System.nanoTime()));
++    }
++
++    public SchedulerMetricsSnapshot snapshot() {
++        final long now = System.nanoTime();
++        this.lastSnapshotTime.set(now);
++        final Map<Long, FairnessScoreboard.FairnessSnapshot> fairnessSnapshots = this.fairnessScoreboard.snapshotAllRegions();
++        final Map<TaskType, TaskLatencyTracker.LatencyMetrics> latencySnapshots = this.latencyTracker.snapshotAll();
++        final EnumMap<TaskType, FairnessScoreboard.TypeSnapshot> typeSnapshots = new EnumMap<>(TaskType.class);
++        for (final TaskType taskType : TaskType.values()) {
++            typeSnapshots.put(taskType, this.fairnessScoreboard.snapshot(taskType));
++        }
++        return new SchedulerMetricsSnapshot(now, Instant.now(), fairnessSnapshots, latencySnapshots, typeSnapshots);
++    }
++
++    public List<FairnessAlert> drainFairnessAlerts() {
++        final List<FairnessAlert> drained = new ArrayList<>();
++        for (FairnessAlert alert; (alert = this.fairnessAlerts.poll()) != null;) {
++            drained.add(alert);
++        }
++        return drained;
++    }
++
++    public long getLastSnapshotTime() {
++        return this.lastSnapshotTime.get();
++    }
++
++    public record SchedulerMetricsSnapshot(long snapshotNanoTime,
++                                           Instant snapshotInstant,
++                                           Map<Long, FairnessScoreboard.FairnessSnapshot> regionFairness,
++                                           Map<TaskType, TaskLatencyTracker.LatencyMetrics> latencyMetrics,
++                                           Map<TaskType, FairnessScoreboard.TypeSnapshot> typeFairness) {}
++
++    public record FairnessAlert(long regionId, long observedWaitNanoseconds, long createdNanoTime) {}
++}
++
+diff --git a/io/papermc/paper/threadedregions/scheduling/AdaptiveLoadBalancer.java b/io/papermc/paper/threadedregions/scheduling/AdaptiveLoadBalancer.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..60a2ab9b565ab1f7252a298744cbaa853d6fba9a
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/scheduling/AdaptiveLoadBalancer.java
+@@ -0,0 +1,208 @@
++package io.papermc.paper.threadedregions.scheduling;
++
++import io.papermc.paper.threadedregions.TickRegionScheduler;
++import io.papermc.paper.threadedregions.TickRegions;
++import io.papermc.paper.threadedregions.monitoring.FairnessMonitor;
++import io.papermc.paper.threadedregions.monitoring.SchedulerMetricsCollector;
++import java.util.List;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLong;
++
++public final class AdaptiveLoadBalancer {
++
++    private final SchedulingServices services;
++    
++    private volatile long systemLoadThreshold = TimeUnit.MILLISECONDS.toNanos(50L);
++    private volatile double highLoadFairnessMultiplier = 1.5;
++    private volatile double lowLoadFairnessMultiplier = 0.75;
++    private final AtomicLong lastLoadAssessment = new AtomicLong();
++
++    AdaptiveLoadBalancer(final SchedulingServices services) {
++        this.services = services;
++    }
++    
++    public void assessSystemLoad() {
++        final long now = System.nanoTime();
++        final long lastAssessment = this.lastLoadAssessment.get();
++        
++        if (now - lastAssessment < TimeUnit.SECONDS.toNanos(5L)) {
++            return;
++        }
++        
++        if (!this.lastLoadAssessment.compareAndSet(lastAssessment, now)) {
++            return;
++        }
++        
++        try {
++            if (this.services == null || this.services.getMetricsCollector() == null) {
++                return;
++            }
++            
++            final SchedulerMetricsCollector.SchedulerMetricsSnapshot snapshot = this.services.getMetricsCollector().snapshot();
++            if (snapshot == null || snapshot.latencyMetrics() == null) {
++                return;
++            }
++            
++            long totalWait = 0L;
++            long totalExecutions = 0L;
++            for (final var latencyMetrics : snapshot.latencyMetrics().values()) {
++                if (latencyMetrics != null && latencyMetrics.taskCount() > 0L) {
++                    final double avgWait = latencyMetrics.averageWait();
++                    final long count = latencyMetrics.taskCount();
++                    if (avgWait >= 0D && avgWait <= Long.MAX_VALUE && count > 0L) {
++                        final long waitContribution = (long)(avgWait * count);
++                        if (waitContribution >= 0L && totalWait <= Long.MAX_VALUE - waitContribution) {
++                            totalWait += waitContribution;
++                            totalExecutions += count;
++                        }
++                    }
++                }
++            }
++            
++            if (totalExecutions <= 0L) {
++                return;
++            }
++            
++            final double averageWait = (double)totalWait / (double)totalExecutions;
++            if (!Double.isFinite(averageWait) || averageWait < 0D) {
++                return;
++            }
++            
++            synchronized (this) {
++                if (averageWait > this.systemLoadThreshold) {
++                    this.highLoadFairnessMultiplier = Math.min(2.0, Math.max(1.0, this.highLoadFairnessMultiplier * 1.1));
++                    this.lowLoadFairnessMultiplier = Math.max(0.5, Math.min(1.0, this.lowLoadFairnessMultiplier * 0.95));
++                } else {
++                    this.highLoadFairnessMultiplier = Math.max(1.0, Math.min(2.0, this.highLoadFairnessMultiplier * 0.95));
++                    this.lowLoadFairnessMultiplier = Math.min(1.0, Math.max(0.5, this.lowLoadFairnessMultiplier * 1.05));
++                }
++            }
++        } catch (final Throwable throwable) {
++            // Load assessment failure should not break scheduling
++        }
++    }
++
++    public void onRegionSplit(final TickRegions.TickRegionData parent,
++                              final List<TickRegions.TickRegionData> children) {
++        if (children == null || children.isEmpty()) {
++            return;
++        }
++
++        this.assessSystemLoad();
++
++        final FairnessScoreboard.FairnessSnapshot parentFairness = this.services.getFairnessScoreboard().snapshot(parent.id);
++        final FairnessMonitor.RegionState parentState = this.services.getFairnessMonitor().snapshotRegion(parent.id);
++
++        long candidateDebt = parent.getFairnessDebt();
++        candidateDebt = Math.max(candidateDebt, parentFairness.lastObservedWait());
++        candidateDebt = Math.max(candidateDebt, (long)parentFairness.averageWait());
++        candidateDebt = Math.max(candidateDebt, parentState.lastObservedWait());
++
++        if (parentState.consecutiveBreaches() > 0) {
++            candidateDebt = Math.max(candidateDebt, (long)(TickRegionScheduler.TIME_BETWEEN_TICKS / 2L * this.highLoadFairnessMultiplier));
++        } else {
++            final double multiplier = this.getSystemLoadMultiplier();
++            candidateDebt = (long)(candidateDebt * multiplier);
++        }
++
++        if (candidateDebt <= 0L) {
++            this.services.getFairnessMonitor().resetRegion(parent.id);
++            this.services.getFairnessScoreboard().clearRegion(parent.id);
++            return;
++        }
++
++        candidateDebt = Math.min(candidateDebt, TickRegionScheduler.TIME_BETWEEN_TICKS);
++        final int childCount = children.size();
++        if (childCount <= 0) {
++            return;
++        }
++        
++        final long perChildDebt = Math.max(1L, (long)(candidateDebt / childCount * this.getSystemLoadMultiplier()));
++
++        for (final TickRegions.TickRegionData child : children) {
++            child.setFairnessDebt(perChildDebt);
++            this.services.getFairnessMonitor().resetRegion(child.id);
++            this.services.getFairnessScoreboard().clearRegion(child.id);
++        }
++
++        this.services.getFairnessMonitor().resetRegion(parent.id);
++        this.services.getFairnessScoreboard().clearRegion(parent.id);
++    }
++
++    public void onRegionMerge(final TickRegions.TickRegionData from,
++                              final TickRegions.TickRegionData into) {
++        this.assessSystemLoad();
++
++        final FairnessScoreboard.FairnessSnapshot fromFairness = this.services.getFairnessScoreboard().snapshot(from.id);
++        final FairnessMonitor.RegionState fromState = this.services.getFairnessMonitor().snapshotRegion(from.id);
++
++        long candidateDebt = into.getFairnessDebt();
++        candidateDebt = Math.max(candidateDebt, fromFairness.lastObservedWait());
++        candidateDebt = Math.max(candidateDebt, (long)fromFairness.averageWait());
++        candidateDebt = Math.max(candidateDebt, fromState.lastObservedWait());
++
++        if (fromState.consecutiveBreaches() > 0) {
++            candidateDebt = Math.max(candidateDebt, (long)(TickRegionScheduler.TIME_BETWEEN_TICKS / 3L * this.highLoadFairnessMultiplier));
++        } else {
++            final double multiplier = this.getSystemLoadMultiplier();
++            candidateDebt = (long)(candidateDebt * multiplier);
++        }
++
++        if (candidateDebt > 0L) {
++            into.setFairnessDebt(Math.min(candidateDebt, TickRegionScheduler.TIME_BETWEEN_TICKS));
++        }
++
++        this.services.getFairnessMonitor().resetRegion(from.id);
++        this.services.getFairnessScoreboard().clearRegion(from.id);
++    }
++    
++    private double getSystemLoadMultiplier() {
++        try {
++            if (this.services == null || this.services.getMetricsCollector() == null) {
++                return 1.0;
++            }
++            
++            final SchedulerMetricsCollector.SchedulerMetricsSnapshot snapshot = this.services.getMetricsCollector().snapshot();
++            if (snapshot == null || snapshot.latencyMetrics() == null) {
++                return 1.0;
++            }
++            
++            long totalWait = 0L;
++            long totalExecutions = 0L;
++            for (final var latencyMetrics : snapshot.latencyMetrics().values()) {
++                if (latencyMetrics != null && latencyMetrics.taskCount() > 0L) {
++                    final double avgWait = latencyMetrics.averageWait();
++                    final long count = latencyMetrics.taskCount();
++                    if (avgWait >= 0D && avgWait <= Long.MAX_VALUE && count > 0L) {
++                        final long waitContribution = (long)(avgWait * count);
++                        if (waitContribution >= 0L && totalWait <= Long.MAX_VALUE - waitContribution) {
++                            totalWait += waitContribution;
++                            totalExecutions += count;
++                        }
++                    }
++                }
++            }
++            
++            if (totalExecutions <= 0L) {
++                return 1.0;
++            }
++            
++            final double averageWait = (double)totalWait / (double)totalExecutions;
++            if (!Double.isFinite(averageWait) || averageWait < 0D) {
++                return 1.0;
++            }
++            
++            final double highMultiplier = this.highLoadFairnessMultiplier;
++            final double lowMultiplier = this.lowLoadFairnessMultiplier;
++            
++            if (averageWait > this.systemLoadThreshold) {
++                return Math.max(1.0, Math.min(2.0, highMultiplier));
++            } else {
++                return Math.max(0.5, Math.min(1.0, lowMultiplier));
++            }
++        } catch (final Throwable throwable) {
++            return 1.0;
++        }
++    }
++}
++
+diff --git a/io/papermc/paper/threadedregions/scheduling/FairnessScoreboard.java b/io/papermc/paper/threadedregions/scheduling/FairnessScoreboard.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f28bf21412a2f8fc43b73d5dd6be780727c85d58
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/scheduling/FairnessScoreboard.java
+@@ -0,0 +1,149 @@
++package io.papermc.paper.threadedregions.scheduling;
++
++import java.util.EnumMap;
++import java.util.Map;
++import java.util.Objects;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.atomic.LongAdder;
++
++public final class FairnessScoreboard {
++
++    private final ConcurrentMap<Long, FairnessStat> regionStats = new ConcurrentHashMap<>();
++    private final EnumMap<TaskType, TypeAccumulator> typeAccumulators = new EnumMap<>(TaskType.class);
++
++    public FairnessScoreboard() {
++        for (final TaskType type : TaskType.values()) {
++            this.typeAccumulators.put(type, new TypeAccumulator());
++        }
++    }
++
++    public void recordExecution(final long regionId, final TaskType type, final long waitNanoseconds) {
++        Objects.requireNonNull(type, "type");
++        final long now = System.nanoTime();
++        final long sanitizedWait = Math.max(waitNanoseconds, 0L);
++
++        if (type.isRegionBound()) {
++            final FairnessStat stat = this.regionStats.computeIfAbsent(regionId, FairnessStat::new);
++            stat.executions.increment();
++            stat.totalWait.add(sanitizedWait);
++            stat.maxWait.accumulateAndGet(sanitizedWait, Math::max);
++            stat.lastExecutionTime.set(now);
++            stat.lastObservedWait.set(sanitizedWait);
++        }
++
++        final TypeAccumulator accumulator = this.typeAccumulators.get(type);
++        if (accumulator != null) {
++            accumulator.executions.increment();
++            accumulator.totalWait.add(sanitizedWait);
++            accumulator.maxWait.accumulateAndGet(sanitizedWait, Math::max);
++            accumulator.lastExecutionTime.set(now);
++        }
++    }
++
++    public void recordStarvationWarning(final long regionId) {
++        final FairnessStat stat = this.regionStats.computeIfAbsent(regionId, FairnessStat::new);
++        stat.starvationWarnings.increment();
++        stat.lastStarvationTime.set(System.nanoTime());
++    }
++
++    public FairnessSnapshot snapshot(final long regionId) {
++        final FairnessStat stat = this.regionStats.get(regionId);
++        if (stat == null) {
++            return FairnessSnapshot.EMPTY;
++        }
++        return stat.snapshot();
++    }
++
++    public Map<Long, FairnessSnapshot> snapshotAllRegions() {
++        final ConcurrentHashMap<Long, FairnessSnapshot> snapshot = new ConcurrentHashMap<>(this.regionStats.size());
++        this.regionStats.forEach((id, stat) -> snapshot.put(id, stat.snapshot()));
++        return snapshot;
++    }
++
++    public void clearRegion(final long regionId) {
++        this.regionStats.remove(regionId);
++    }
++
++    public TypeSnapshot snapshot(final TaskType type) {
++        final TypeAccumulator accumulator = this.typeAccumulators.get(type);
++        return accumulator == null ? TypeSnapshot.EMPTY : accumulator.snapshot();
++    }
++
++    public Map<TaskType, TypeSnapshot> snapshotAllTypes() {
++        final EnumMap<TaskType, TypeSnapshot> snapshot = new EnumMap<>(TaskType.class);
++        for (final Map.Entry<TaskType, TypeAccumulator> entry : this.typeAccumulators.entrySet()) {
++            snapshot.put(entry.getKey(), entry.getValue().snapshot());
++        }
++        return snapshot;
++    }
++
++    private static final class FairnessStat {
++
++        private final long regionId;
++        private final LongAdder executions = new LongAdder();
++        private final LongAdder totalWait = new LongAdder();
++        private final LongAdder starvationWarnings = new LongAdder();
++        private final AtomicLong maxWait = new AtomicLong();
++        private final AtomicLong lastExecutionTime = new AtomicLong();
++        private final AtomicLong lastObservedWait = new AtomicLong();
++        private final AtomicLong lastStarvationTime = new AtomicLong();
++
++        private FairnessStat(final long regionId) {
++            this.regionId = regionId;
++        }
++
++        private FairnessSnapshot snapshot() {
++            final long count = this.executions.sum();
++            final long total = this.totalWait.sum();
++            final double average = count == 0L ? 0D : (double)total / (double)count;
++            return new FairnessSnapshot(
++                this.regionId,
++                count,
++                average,
++                this.maxWait.get(),
++                this.lastExecutionTime.get(),
++                this.lastObservedWait.get(),
++                this.starvationWarnings.sum(),
++                this.lastStarvationTime.get()
++            );
++        }
++    }
++
++    private static final class TypeAccumulator {
++
++        private final LongAdder executions = new LongAdder();
++        private final LongAdder totalWait = new LongAdder();
++        private final AtomicLong maxWait = new AtomicLong();
++        private final AtomicLong lastExecutionTime = new AtomicLong();
++
++        private TypeSnapshot snapshot() {
++            final long count = this.executions.sum();
++            final long total = this.totalWait.sum();
++            final double average = count == 0L ? 0D : (double)total / (double)count;
++            return new TypeSnapshot(count, average, this.maxWait.get(), this.lastExecutionTime.get());
++        }
++    }
++
++    public record FairnessSnapshot(long regionId,
++                                   long executions,
++                                   double averageWait,
++                                   long maxWait,
++                                   long lastExecutionTime,
++                                   long lastObservedWait,
++                                   long starvationWarnings,
++                                   long lastStarvationTime) {
++
++        public static final FairnessSnapshot EMPTY = new FairnessSnapshot(-1L, 0L, 0D, 0L, 0L, 0L, 0L, 0L);
++    }
++
++    public record TypeSnapshot(long executions,
++                               double averageWait,
++                               long maxWait,
++                               long lastExecutionTime) {
++
++        public static final TypeSnapshot EMPTY = new TypeSnapshot(0L, 0D, 0L, 0L);
++    }
++}
++
+diff --git a/io/papermc/paper/threadedregions/scheduling/SchedulingServices.java b/io/papermc/paper/threadedregions/scheduling/SchedulingServices.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b281a05318023a741d6f6f3712db7ba2c1f4a48c
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/scheduling/SchedulingServices.java
+@@ -0,0 +1,49 @@
++package io.papermc.paper.threadedregions.scheduling;
++
++import io.papermc.paper.threadedregions.monitoring.FairnessMonitor;
++import io.papermc.paper.threadedregions.monitoring.SchedulerMetricsCollector;
++
++import java.util.concurrent.TimeUnit;
++
++public final class SchedulingServices {
++
++    private static final SchedulingServices INSTANCE = new SchedulingServices();
++
++    private final TaskLatencyTracker latencyTracker = new TaskLatencyTracker();
++    private final FairnessScoreboard fairnessScoreboard = new FairnessScoreboard();
++    private final SchedulerMetricsCollector metricsCollector = new SchedulerMetricsCollector(this.fairnessScoreboard, this.latencyTracker);
++    private final FairnessMonitor fairnessMonitor = new FairnessMonitor(this.metricsCollector, TimeUnit.MILLISECONDS.toNanos(200L), 3);
++    private final AdaptiveLoadBalancer adaptiveLoadBalancer = new AdaptiveLoadBalancer(this);
++    private final UrgentTaskCoordinator urgentTaskCoordinator = new UrgentTaskCoordinator(this);
++
++    private SchedulingServices() {}
++
++    public static SchedulingServices get() {
++        return INSTANCE;
++    }
++
++    public TaskLatencyTracker getLatencyTracker() {
++        return this.latencyTracker;
++    }
++
++    public FairnessScoreboard getFairnessScoreboard() {
++        return this.fairnessScoreboard;
++    }
++
++    public SchedulerMetricsCollector getMetricsCollector() {
++        return this.metricsCollector;
++    }
++
++    public FairnessMonitor getFairnessMonitor() {
++        return this.fairnessMonitor;
++    }
++
++    public AdaptiveLoadBalancer getAdaptiveLoadBalancer() {
++        return this.adaptiveLoadBalancer;
++    }
++
++    public UrgentTaskCoordinator getUrgentTaskCoordinator() {
++        return this.urgentTaskCoordinator;
++    }
++}
++
+diff --git a/io/papermc/paper/threadedregions/scheduling/TaskLatencyTracker.java b/io/papermc/paper/threadedregions/scheduling/TaskLatencyTracker.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d09d2f96778a0dbcf96b3a99654924e98e19e8f
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/scheduling/TaskLatencyTracker.java
+@@ -0,0 +1,131 @@
++package io.papermc.paper.threadedregions.scheduling;
++
++import java.util.EnumMap;
++import java.util.Map;
++import java.util.Objects;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.atomic.DoubleAdder;
++import java.util.concurrent.atomic.LongAdder;
++
++public final class TaskLatencyTracker {
++
++    private final EnumMap<TaskType, LatencyAccumulator> accumulators = new EnumMap<>(TaskType.class);
++
++    public TaskLatencyTracker() {
++        for (final TaskType type : TaskType.values()) {
++            this.accumulators.put(type, new LatencyAccumulator());
++        }
++    }
++
++    public Ticket recordEnqueue(final TaskType type) {
++        return new Ticket(type, System.nanoTime());
++    }
++
++    public Ticket recordEnqueue(final TaskType type, final long enqueueNanoTime) {
++        return new Ticket(type, enqueueNanoTime);
++    }
++
++    public void recordExecution(final Ticket ticket) {
++        if (ticket == null) {
++            return;
++        }
++        final long waitTime = System.nanoTime() - ticket.enqueueNanoTime();
++        this.recordWait(ticket.type(), Math.max(waitTime, 0L));
++    }
++
++    public void recordWait(final TaskType type, final long waitNanoseconds) {
++        Objects.requireNonNull(type, "type");
++        if (waitNanoseconds < 0L) {
++            return;
++        }
++        final LatencyAccumulator accumulator = this.accumulators.get(type);
++        if (accumulator != null) {
++            accumulator.totalWait.add(waitNanoseconds);
++            accumulator.taskCount.increment();
++            accumulator.totalWaitSquares.add((double)waitNanoseconds * (double)waitNanoseconds);
++            accumulator.maxWait.accumulateAndGet(waitNanoseconds, Math::max);
++            accumulator.minWait.accumulateAndGet(waitNanoseconds, Math::min);
++        }
++    }
++
++    public LatencyMetrics snapshot(final TaskType type) {
++        Objects.requireNonNull(type, "type");
++        final LatencyAccumulator accumulator = this.accumulators.get(type);
++        return accumulator.snapshot();
++    }
++
++    public Map<TaskType, LatencyMetrics> snapshotAll() {
++        final EnumMap<TaskType, LatencyMetrics> snapshot = new EnumMap<>(TaskType.class);
++        for (final Map.Entry<TaskType, LatencyAccumulator> entry : this.accumulators.entrySet()) {
++            snapshot.put(entry.getKey(), entry.getValue().snapshot());
++        }
++        return snapshot;
++    }
++
++    public record Ticket(TaskType type, long enqueueNanoTime) {}
++
++    public static final class LatencyMetrics {
++
++        public static final LatencyMetrics EMPTY = new LatencyMetrics(0L, 0D, 0D, 0L, 0L);
++
++        private final long taskCount;
++        private final double averageWait;
++        private final double standardDeviation;
++        private final long maxWait;
++        private final long minWait;
++
++        private LatencyMetrics(final long taskCount, final double averageWait, final double standardDeviation,
++                               final long maxWait, final long minWait) {
++            this.taskCount = taskCount;
++            this.averageWait = averageWait;
++            this.standardDeviation = standardDeviation;
++            this.maxWait = maxWait;
++            this.minWait = minWait;
++        }
++
++        public long taskCount() {
++            return this.taskCount;
++        }
++
++        public double averageWait() {
++            return this.averageWait;
++        }
++
++        public double standardDeviation() {
++            return this.standardDeviation;
++        }
++
++        public long maxWait() {
++            return this.maxWait;
++        }
++
++        public long minWait() {
++            return this.minWait;
++        }
++    }
++
++    private static final class LatencyAccumulator {
++
++        private final LongAdder totalWait = new LongAdder();
++        private final DoubleAdder totalWaitSquares = new DoubleAdder();
++        private final LongAdder taskCount = new LongAdder();
++        private final AtomicLong maxWait = new AtomicLong();
++        private final AtomicLong minWait = new AtomicLong(Long.MAX_VALUE);
++
++        private LatencyMetrics snapshot() {
++            final long count = this.taskCount.sum();
++            if (count == 0L) {
++                return LatencyMetrics.EMPTY;
++            }
++            final double total = this.totalWait.sum();
++            final double avg = total / (double)count;
++            final double squares = this.totalWaitSquares.sum();
++            final double variance = Math.max(0D, (squares / (double)count) - (avg * avg));
++            final double stdDev = Math.sqrt(variance);
++            final long max = this.maxWait.get();
++            final long min = this.minWait.get();
++            return new LatencyMetrics(count, avg, stdDev, max, min == Long.MAX_VALUE ? 0L : min);
++        }
++    }
++}
++
+diff --git a/io/papermc/paper/threadedregions/scheduling/TaskType.java b/io/papermc/paper/threadedregions/scheduling/TaskType.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e42e6775a7534c4dfe75eeefcfc67d34a94911c
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/scheduling/TaskType.java
+@@ -0,0 +1,17 @@
++package io.papermc.paper.threadedregions.scheduling;
++
++public enum TaskType {
++
++    REGION,
++
++    ENTITY,
++
++    GLOBAL,
++
++    IO;
++
++    public boolean isRegionBound() {
++        return this == REGION || this == ENTITY || this == IO;
++    }
++}
++
+diff --git a/io/papermc/paper/threadedregions/scheduling/UrgentTaskCoordinator.java b/io/papermc/paper/threadedregions/scheduling/UrgentTaskCoordinator.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1929b7e7d863fd8bfdd5526c92ad7e5a9271de82
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/scheduling/UrgentTaskCoordinator.java
+@@ -0,0 +1,38 @@
++package io.papermc.paper.threadedregions.scheduling;
++
++import com.mojang.logging.LogUtils;
++import io.papermc.paper.threadedregions.RegionizedServer;
++import net.minecraft.server.level.ServerLevel;
++import org.slf4j.Logger;
++
++public final class UrgentTaskCoordinator {
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++
++    @SuppressWarnings("unused")
++    private final SchedulingServices services;
++
++    UrgentTaskCoordinator(final SchedulingServices services) {
++        this.services = services;
++    }
++
++    public void queueRegionTask(final ServerLevel world, final int chunkX, final int chunkZ, final Runnable run) {
++        if (world == null) {
++            throw new IllegalArgumentException("world");
++        }
++        if (run == null) {
++            throw new IllegalArgumentException("run");
++        }
++
++        final boolean queued = RegionizedServer.getInstance().taskQueue.queueUrgentTask(world, chunkX, chunkZ, run);
++        if (queued) {
++            return;
++        }
++
++        LOGGER.debug("Region not available for urgent task at {},{} in world {}. Falling back to global queue.",
++            Integer.valueOf(chunkX), Integer.valueOf(chunkZ), world.getWorld().getName());
++
++        RegionizedServer.getInstance().addTask(run, RegionizedServer.GlobalTaskPriority.CRITICAL);
++    }
++}
++

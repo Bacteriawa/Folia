@@ -9,7 +9,7 @@ add explicit block update suppression techniques, it's better
 than the server crashing.
 
 diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
-index 402a90890b9754c9c1a1d209a13cda8c9498f05c..1976a443e7c59e1e18d8a411513df39c83ad1095 100644
+index 8b60d3cccdd0278416b9eb72a4598c782b67800d..2acf7bb76bd61c6c100ba48543d96ae0f08f9064 100644
 --- a/net/minecraft/world/level/Level.java
 +++ b/net/minecraft/world/level/Level.java
 @@ -2045,7 +2045,7 @@ public abstract class Level implements LevelAccessor, UUIDLookup<Entity>, AutoCl

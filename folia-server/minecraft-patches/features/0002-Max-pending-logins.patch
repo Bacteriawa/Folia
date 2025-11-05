@@ -6,7 +6,7 @@ Subject: [PATCH] Max pending logins
 Should help the floodgates on launch
 
 diff --git a/net/minecraft/server/network/ServerLoginPacketListenerImpl.java b/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
-index 8998637bcf1eaeaefa2d6e46a883f761d389a5d0..d6c18d79dc9c0e7ac67a9346008243ace03f71e8 100644
+index 8f07aedb2233f8e43554bec77f9940a398b97941..91ba46925961ea1deb5b92a063115b7d7e4341fc 100644
 --- a/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
 @@ -98,7 +98,7 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
@@ -19,7 +19,7 @@ index 8998637bcf1eaeaefa2d6e46a883f761d389a5d0..d6c18d79dc9c0e7ac67a9346008243ac
  
          if (this.state == ServerLoginPacketListenerImpl.State.WAITING_FOR_DUPE_DISCONNECT
 diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
-index b37ef4ccedfed4bb13f9cda50b1fc5ff7f371664..0de42ad1eefb2258a2520f899f9e62625eab1939 100644
+index 58e8e076facedd22a5c94d6de1344b45b2680228..60aa421884b532f693a5458b06f2ea74ba6f03ce 100644
 --- a/net/minecraft/server/players/PlayerList.java
 +++ b/net/minecraft/server/players/PlayerList.java
 @@ -150,6 +150,17 @@ public abstract class PlayerList {
