@@ -4,6 +4,246 @@ Date: Wed, 12 Nov 2025 22:39:59 +0800
 Subject: [PATCH] Fix Commands
 
 
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+index eff983882c0bce6511939f9f1f705569173eedc6..b285f9ef1fd24d7b548c3dc1d88a40b9da479915 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+@@ -62,6 +62,7 @@ import java.util.function.Predicate;
+ // Folia start - region threading
+ import io.papermc.paper.threadedregions.RegionizedServer;
+ import io.papermc.paper.threadedregions.ThreadedRegionizer;
++import io.papermc.paper.threadedregions.TickRegions;
+ import io.papermc.paper.threadedregions.TickRegionScheduler;
+ import it.unimi.dsi.fastutil.longs.Long2ReferenceOpenHashMap;
+ import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
+@@ -340,7 +341,68 @@ public final class ChunkHolderManager {
+ 
+     public void saveAllChunks(final boolean flush, final boolean shutdown, final boolean logProgress) {
+         // Folia start - region threading
+-        this.saveAllChunksRegionised(flush, shutdown, logProgress, true, true, true);
++        if (TickRegionScheduler.getCurrentRegion() != null) {
++            this.saveAllChunksRegionised(flush, shutdown, logProgress, true, true, true);
++        } else {
++            this.saveAllChunksFromGlobal(flush, shutdown, logProgress);
++        }
++    }
++
++    private void saveAllChunksFromGlobal(final boolean flush, final boolean shutdown, final boolean logProgress) {
++        final ThreadedRegionizer<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> regioniser = this.world.regioniser;
++        final java.util.List<int[]> regionChunkCoordinates = new java.util.ArrayList<>();
++        regioniser.computeForAllRegions(region -> {
++            if (region.regioniser.world != this.world) {
++                return;
++            }
++            Long sectionKeyObj = region.getCenterSection();
++            if (sectionKeyObj == null) {
++                final LongArrayList sections = region.getOwnedSections();
++                if (sections.isEmpty()) {
++                    return;
++                }
++                sectionKeyObj = sections.getLong(0);
++            }
++            final long sectionKey = sectionKeyObj.longValue();
++            final int chunkX = CoordinateUtils.getChunkX(sectionKey) << regioniser.sectionChunkShift;
++            final int chunkZ = CoordinateUtils.getChunkZ(sectionKey) << regioniser.sectionChunkShift;
++            regionChunkCoordinates.add(new int[]{chunkX, chunkZ});
++        });
++
++        if (regionChunkCoordinates.isEmpty()) {
++            return;
++        }
++
++        for (int i = 0, size = regionChunkCoordinates.size(); i < size; ++i) {
++            final int[] coords = regionChunkCoordinates.get(i);
++            final boolean first = i == 0;
++            final boolean last = i == size - 1;
++            final java.util.concurrent.CompletableFuture<Void> future = new java.util.concurrent.CompletableFuture<>();
++            RegionizedServer.getInstance().taskQueue.queueChunkTask(this.world, coords[0], coords[1], () -> {
++                try {
++                    this.saveAllChunksRegionised(flush, shutdown, logProgress, first, last, true);
++                    future.complete(null);
++                } catch (Throwable throwable) {
++                    future.completeExceptionally(throwable);
++                }
++            });
++            joinUnchecked(future);
++        }
++    }
++
++    private static void joinUnchecked(final java.util.concurrent.CompletableFuture<?> future) {
++        try {
++            future.join();
++        } catch (final java.util.concurrent.CompletionException exception) {
++            final Throwable cause = exception.getCause();
++            if (cause instanceof RuntimeException runtimeException) {
++                throw runtimeException;
++            }
++            if (cause instanceof Error error) {
++                throw error;
++            }
++            throw new RuntimeException(cause);
++        }
+     }
+     public void saveAllChunksRegionised(final boolean flush, final boolean shutdown, final boolean logProgress, final boolean first, final boolean last, final boolean checkRegion) {
+         final List<NewChunkHolder> holders = new java.util.ArrayList<>(this.chunkHolders.size() / 10);
+diff --git a/io/papermc/paper/threadedregions/RegionizedServer.java b/io/papermc/paper/threadedregions/RegionizedServer.java
+index eb4f2beb586df1f33249aabd2ae9ac140c8f5552..f2ec1cbdf0803cc5302b18c9e71853ff5b7989ca 100644
+--- a/io/papermc/paper/threadedregions/RegionizedServer.java
++++ b/io/papermc/paper/threadedregions/RegionizedServer.java
+@@ -19,6 +19,8 @@ import net.minecraft.server.dedicated.DedicatedServer;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.server.network.ServerGamePacketListenerImpl;
+ import net.minecraft.world.level.GameRules;
++import net.minecraft.util.profiling.ProfilerFiller;
++import net.minecraft.util.profiling.Profiler;
+ import org.bukkit.Bukkit;
+ import org.slf4j.Logger;
+ import java.util.ArrayList;
+@@ -72,6 +74,10 @@ public final class RegionizedServer {
+         this.lastServerStatus = 0L;
+     }
+ 
++    public long getTickCount() {
++        return this.tickCount;
++    }
++
+     public void addTaskWithoutNotify(final Runnable run) {
+         this.globalTickQueue.add(run);
+     }
+@@ -292,49 +298,68 @@ public final class RegionizedServer {
+      */
+ 
+     private void globalTick(final int tickCount) {
+-        /*
+-        if (false) {
+-            io.papermc.paper.threadedregions.ThreadedTicketLevelPropagator.main(null);
+-        }
+-        this.randomWalk();
+-         */
+-        ++this.tickCount;
+-        // expire invalid click command callbacks
+-        io.papermc.paper.adventure.providers.ClickCallbackProviderImpl.ADVENTURE_CLICK_MANAGER.handleQueue((int)this.tickCount); // Paper // Folia - region threading - moved to global tick
+-        io.papermc.paper.adventure.providers.ClickCallbackProviderImpl.DIALOG_CLICK_MANAGER.handleQueue((int)this.tickCount); // Paper // Folia - region threading - moved to global tick
+-
+-        // scheduler
+-        ((FoliaGlobalRegionScheduler)Bukkit.getGlobalRegionScheduler()).tick();
+-        final io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor monitor = TickRegionScheduler.getFairnessMonitor();
+-        if ((this.tickCount & 31L) == 0L) {
+-            final io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor.MetricsSnapshot snapshot = monitor.snapshot();
+-            this.emitSchedulerMetrics(snapshot);
+-        }
+-        for (final io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor.FairnessAlert alert : monitor.drainAlerts()) {
+-            LOGGER.warn("Detected scheduler starvation: category={} id={} waited={}ms", alert.category(), alert.taskId(), java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(alert.waitedNanos()));
++        final MinecraftServer server = MinecraftServer.getServer();
++        for (int i = 0; i < tickCount; ++i) {
++            boolean sprintTick = false;
++            if (server.tickRateManager().isSprinting()) {
++                sprintTick = server.tickRateManager().checkShouldSprintThisTick();
++            }
++            this.runSingleGlobalTick(server, sprintTick);
++            if (sprintTick) {
++                while (server.tickRateManager().isSprinting()) {
++                    if (!server.tickRateManager().checkShouldSprintThisTick()) {
++                        break;
++                    }
++                    this.runSingleGlobalTick(server, true);
++                }
++            }
+         }
++    }
+ 
+-        // commands
+-        ((DedicatedServer)MinecraftServer.getServer()).handleConsoleInputs();
++    private void runSingleGlobalTick(final MinecraftServer server, final boolean sprintTick) {
++        server.beginMetricsTick();
++        try {
++            server.tickRateManager().tick();
++            final boolean runGame = server.tickRateManager().runsNormally();
+ 
+-        // needs
+-        // player ping sample
+-        // world global tick
+-        // connection tick
++            /*
++            if (false) {
++                io.papermc.paper.threadedregions.ThreadedTicketLevelPropagator.main(null);
++            }
++            this.randomWalk();
++             */
++            ++this.tickCount;
++            io.papermc.paper.adventure.providers.ClickCallbackProviderImpl.ADVENTURE_CLICK_MANAGER.handleQueue((int)this.tickCount); // Paper // Folia - region threading - moved to global tick
++            io.papermc.paper.adventure.providers.ClickCallbackProviderImpl.DIALOG_CLICK_MANAGER.handleQueue((int)this.tickCount); // Paper // Folia - region threading - moved to global tick
++
++            ((FoliaGlobalRegionScheduler)Bukkit.getGlobalRegionScheduler()).tick();
++            final io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor monitor = TickRegionScheduler.getFairnessMonitor();
++            if ((this.tickCount & 31L) == 0L) {
++                final io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor.MetricsSnapshot snapshot = monitor.snapshot();
++                this.emitSchedulerMetrics(snapshot);
++            }
++            for (final io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor.FairnessAlert alert : monitor.drainAlerts()) {
++                LOGGER.warn("Detected scheduler starvation: category={} id={} waited={}ms", alert.category(), alert.taskId(), java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(alert.waitedNanos()));
++            }
+ 
+-        // tick player ping sample
+-        this.tickPlayerSample();
++            ((DedicatedServer)server).handleConsoleInputs();
++            this.tickPlayerSample();
+ 
+-        // tick worlds
+-        for (final ServerLevel world : this.worlds) {
+-            this.globalTick(world, tickCount);
+-        }
++            if (runGame) {
++                for (final ServerLevel world : this.worlds) {
++                    this.globalTick(world, 1);
++                }
++            }
+ 
+-        // tick connections
+-        this.tickConnections();
++            this.tickConnections();
++            server.getPlayerList().tick();
+ 
+-        // player list
+-        MinecraftServer.getServer().getPlayerList().tick();
++            if (sprintTick) {
++                server.tickRateManager().endTickWork();
++            }
++        } finally {
++            server.endMetricsRecordingTick();
++        }
+     }
+ 
+     private void tickPlayerSample() {
+@@ -481,11 +506,23 @@ public final class RegionizedServer {
+     }
+ 
+     private void tickTime(final ServerLevel world, final int tickCount) {
+-        if (world.tickTime) {
+-            if (world.getGameRules().getBoolean(GameRules.RULE_DAYLIGHT)) {
+-                world.setDayTime(world.levelData.getDayTime() + (long)tickCount);
+-            }
+-            world.serverLevelData.setGameTime(world.serverLevelData.getGameTime() + (long)tickCount);
++        if (!world.tickTime) {
++            return;
++        }
++
++        MinecraftServer server = world.getServer();
++        long gameTime = world.serverLevelData.getGameTime();
++        ProfilerFiller profiler = net.minecraft.util.profiling.Profiler.get();
++        for (int i = 0; i < tickCount; ++i) {
++            gameTime++;
++            profiler.push("scheduledFunctions");
++            world.serverLevelData.getScheduledEvents().tick(server, gameTime);
++            profiler.pop();
++        }
++        world.serverLevelData.setGameTime(gameTime);
++
++        if (world.getGameRules().getBoolean(GameRules.RULE_DAYLIGHT)) {
++            world.setDayTime(world.levelData.getDayTime() + (long)tickCount);
+         }
+     }
+ 
 diff --git a/io/papermc/paper/threadedregions/commands/CommandExecutionBridge.java b/io/papermc/paper/threadedregions/commands/CommandExecutionBridge.java
 new file mode 100644
 index 0000000000000000000000000000000000000000..adc4b8b8534a039f4e6c0182b3b046c91dea7621
@@ -231,10 +471,10 @@ index 0000000000000000000000000000000000000000..adc4b8b8534a039f4e6c0182b3b046c9
 +    }
 +}
 diff --git a/net/minecraft/commands/Commands.java b/net/minecraft/commands/Commands.java
-index ad19e9e599b26dfdb53929d9410860cb1b97698c..1fb92c1a40423896d2fcb79286853df5b603d1b2 100644
+index ad19e9e599b26dfdb53929d9410860cb1b97698c..4b9fe0f75e6abdac01081f3437eec2865c118665 100644
 --- a/net/minecraft/commands/Commands.java
 +++ b/net/minecraft/commands/Commands.java
-@@ -185,15 +185,15 @@ public class Commands {
+@@ -185,12 +185,12 @@ public class Commands {
          AdvancementCommands.register(this.dispatcher);
          AttributeCommand.register(this.dispatcher, context);
          ExecuteCommand.register(this.dispatcher, context);
@@ -246,23 +486,12 @@ index ad19e9e599b26dfdb53929d9410860cb1b97698c..1fb92c1a40423896d2fcb79286853df5
          DamageCommand.register(this.dispatcher, context);
 -        //DataCommands.register(this.dispatcher); // Folia - region threading - TODO
 -        //DataPackCommand.register(this.dispatcher, context); // Folia - region threading - TODO
--        //DebugCommand.register(this.dispatcher); // Folia - region threading - TODO
 +        DataCommands.register(this.dispatcher); // Folia - thread-safe via CommandExecutionBridge in DataAccessors
 +        DataPackCommand.register(this.dispatcher, context); // Folia - thread-safe via CommandExecutionBridge
-+        DebugCommand.register(this.dispatcher); // Folia - thread-safe via CommandExecutionBridge
+         //DebugCommand.register(this.dispatcher); // Folia - region threading - TODO
          DefaultGameModeCommands.register(this.dispatcher);
--        //DialogCommand.register(this.dispatcher, context); // Folia - region threading - TODO
-+        DialogCommand.register(this.dispatcher, context); // Folia - entity-aware via CommandExecutionBridge
-         DifficultyCommand.register(this.dispatcher);
-         EffectCommands.register(this.dispatcher, context);
-         EmoteCommands.register(this.dispatcher);
-@@ -202,49 +202,50 @@ public class Commands {
-         FillCommand.register(this.dispatcher, context);
-         FillBiomeCommand.register(this.dispatcher, context);
-         ForceLoadCommand.register(this.dispatcher);
--        //FunctionCommand.register(this.dispatcher); // Folia - region threading - TODO
-+        FunctionCommand.register(this.dispatcher); // Folia - thread-safe via CommandExecutionBridge
-         GameModeCommand.register(this.dispatcher);
+         //DialogCommand.register(this.dispatcher, context); // Folia - region threading - TODO
+@@ -207,12 +207,12 @@ public class Commands {
          GameRuleCommand.register(this.dispatcher, context);
          GiveCommand.register(this.dispatcher, context);
          HelpCommand.register(this.dispatcher);
@@ -277,62 +506,195 @@ index ad19e9e599b26dfdb53929d9410860cb1b97698c..1fb92c1a40423896d2fcb79286853df5
          MsgCommand.register(this.dispatcher);
          ParticleCommand.register(this.dispatcher, context);
          PlaceCommand.register(this.dispatcher);
-         PlaySoundCommand.register(this.dispatcher);
-         RandomCommand.register(this.dispatcher);
--        //ReloadCommand.register(this.dispatcher); // Folia - region threading
-+        ReloadCommand.register(this.dispatcher); // Folia - thread-safe via CommandExecutionBridge
+@@ -221,11 +221,12 @@ public class Commands {
+         //ReloadCommand.register(this.dispatcher); // Folia - region threading
          RecipeCommand.register(this.dispatcher);
--        //ReturnCommand.register(this.dispatcher); // Folia - region threading - TODO later
+         //ReturnCommand.register(this.dispatcher); // Folia - region threading - TODO later
 -        //RideCommand.register(this.dispatcher); // Folia - region threading - TODO later
 -        //RotateCommand.register(this.dispatcher); // Folia - region threading - TODO later
-+        ReturnCommand.register(this.dispatcher); // Folia - safe (no thread-sensitive state)
 +        RideCommand.register(this.dispatcher); // Folia - requires same chunk to ensure thread safety
 +        RotateCommand.register(this.dispatcher); // Folia - entity-aware via CommandExecutionBridge
 +        SpectateCommand.register(this.dispatcher); // Folia - entity-aware via CommandExecutionBridge
          SayCommand.register(this.dispatcher);
--        //ScheduleCommand.register(this.dispatcher); // Folia - region threading
+         //ScheduleCommand.register(this.dispatcher); // Folia - region threading
 -        //ScoreboardCommand.register(this.dispatcher, context); // Folia - region threading
-+        ScheduleCommand.register(this.dispatcher); // Folia - thread-safe via CommandExecutionBridge
 +        ScoreboardCommand.register(this.dispatcher, context); // Folia - thread-safe via CommandExecutionBridge
          SeedCommand.register(this.dispatcher, selection != Commands.CommandSelection.INTEGRATED);
          VersionCommand.register(this.dispatcher, selection != Commands.CommandSelection.INTEGRATED);
          SetBlockCommand.register(this.dispatcher, context);
-         SetSpawnCommand.register(this.dispatcher);
-         SetWorldSpawnCommand.register(this.dispatcher);
-         //SpectateCommand.register(this.dispatcher); // Folia - region threading - TODO later
--        //SpreadPlayersCommand.register(this.dispatcher); // Folia - region threading - TODO later
-+        SpreadPlayersCommand.register(this.dispatcher); // Folia - region-aware via CommandExecutionBridge
+@@ -235,8 +236,8 @@ public class Commands {
+         //SpreadPlayersCommand.register(this.dispatcher); // Folia - region threading - TODO later
          StopSoundCommand.register(this.dispatcher);
          SummonCommand.register(this.dispatcher, context);
 -        //TagCommand.register(this.dispatcher); // Folia - region threading - TODO later
 -        //TeamCommand.register(this.dispatcher, context); // Folia - region threading - TODO later
--        //TeamMsgCommand.register(this.dispatcher); // Folia - region threading - TODO later
 +        TagCommand.register(this.dispatcher); // Folia - uses CommandExecutionBridge for entity operations
 +        TeamCommand.register(this.dispatcher, context); // Folia - thread-safe via CommandExecutionBridge on scoreboard
-+        TeamMsgCommand.register(this.dispatcher); // Folia - entity-aware via CommandExecutionBridge
+         //TeamMsgCommand.register(this.dispatcher); // Folia - region threading - TODO later
          TeleportCommand.register(this.dispatcher);
          TellRawCommand.register(this.dispatcher, context);
-         //TestCommand.register(this.dispatcher, context); // Folia - region threading
--        //TickCommand.register(this.dispatcher); // Folia - region threading - TODO later
-+        TickCommand.register(this.dispatcher); // Folia - thread-safe via CommandExecutionBridge
-         TimeCommand.register(this.dispatcher);
-         TitleCommand.register(this.dispatcher, context);
--        //TriggerCommand.register(this.dispatcher); // Folia - region threading - TODO later
-+        TriggerCommand.register(this.dispatcher); // Folia - uses CommandExecutionBridge for scoreboard ops
-         //WaypointCommand.register(this.dispatcher, context); // Folia - region threading - TODO later
-         WeatherCommand.register(this.dispatcher);
-         WorldBorderCommand.register(this.dispatcher);
-@@ -272,8 +273,8 @@ public class Commands {
-             OpCommand.register(this.dispatcher);
-             PardonCommand.register(this.dispatcher);
-             PardonIpCommand.register(this.dispatcher);
--            //PerfCommand.register(this.dispatcher); // Folia - region threading - TODO later
--            //SaveAllCommand.register(this.dispatcher); // Folia - region threading - TODO later
-+            PerfCommand.register(this.dispatcher); // Folia - thread-safe via CommandExecutionBridge
-+            SaveAllCommand.register(this.dispatcher); // Folia - thread-safe via CommandExecutionBridge
-             SaveOffCommand.register(this.dispatcher);
-             SaveOnCommand.register(this.dispatcher);
-             SetPlayerIdleTimeoutCommand.register(this.dispatcher);
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 196996aa8094bd53b61f2797b4ff3b9bcae16132..0a82ea96cf842ddd2153492608b7cf6e9fb8e288 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1637,6 +1637,10 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         };
+         // Folia end - region threading
+ 
++        if (!this.tickRateManager.runsNormally()) {
++            return;
++        }
++
+         this.server.spark.tickStart(); // Paper - spark
+         new com.destroystokyo.paper.event.server.ServerTickStartEvent((int)region.getCurrentTick()).callEvent(); // Paper - Server Tick Events // Folia - region threading
+         // Folia start - region threading
+@@ -2189,7 +2193,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     }
+ 
+     public int getTickCount() {
+-        throw new UnsupportedOperationException(); // Folia - region threading
++        return (int)io.papermc.paper.threadedregions.RegionizedServer.getInstance().getTickCount(); // Folia - region threading
+     }
+ 
+     public int getSpawnProtectionRadius() {
+@@ -2318,7 +2322,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         // Paper end - Add ServerResourcesReloadedEvent
+         CompletableFuture<Void> completableFuture = CompletableFuture.<ImmutableList>supplyAsync(
+                 () -> selectedIds.stream().map(this.packRepository::getPack).filter(Objects::nonNull).map(Pack::open).collect(ImmutableList.toImmutableList()),
+-                this
++                this.executor
+             )
+             .thenCompose(
+                 list -> {
+@@ -2344,41 +2348,42 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             )
+             .thenAcceptAsync(
+                 reloadableResources -> {
+-                    io.papermc.paper.command.brigadier.PaperBrigadier.moveBukkitCommands(this.resources.managers().getCommands(), reloadableResources.managers().commands); // Paper
+-                    this.resources.close();
+-                    this.resources = reloadableResources;
+-                    this.packRepository.setSelected(selectedIds, false); // Paper - add pendingReload flag to determine required pack loading - false as this is *after* a reload (see above)
+-                    WorldDataConfiguration worldDataConfiguration = new WorldDataConfiguration(
+-                        getSelectedPacks(this.packRepository, true), this.worldData.enabledFeatures()
+-                    );
+-                    this.worldData.setDataConfiguration(worldDataConfiguration);
+-                    this.resources.managers.updateStaticRegistryTags();
+-                    this.resources.managers.getRecipeManager().finalizeRecipeLoading(this.worldData.enabledFeatures());
+-                    this.potionBrewing = this.potionBrewing.reload(this.worldData.enabledFeatures()); // Paper - Custom Potion Mixes
+-                    if (Thread.currentThread() != this.serverThread) return; // Paper
+-                    // Paper start - we don't need to save everything, just advancements
+-                    // this.getPlayerList().saveAll();
+-                    for (final ServerPlayer player : this.getPlayerList().getPlayers()) {
+-                        player.getAdvancements().save();
+-                    }
+-                    // Paper end - we don't need to save everything, just advancements
+-                    this.getPlayerList().reloadResources();
+-                    this.functionManager.replaceLibrary(this.resources.managers.getFunctionLibrary());
+-                    this.structureTemplateManager.onResourceManagerReload(this.resources.resourceManager);
+-                    this.fuelValues = FuelValues.vanillaBurnTimes(this.registries.compositeAccess(), this.worldData.enabledFeatures());
+-                    org.bukkit.craftbukkit.block.data.CraftBlockData.reloadCache(); // Paper - cache block data strings; they can be defined by datapacks so refresh it here
+-                    // Paper start - brigadier command API
+-                    io.papermc.paper.command.brigadier.PaperCommands.INSTANCE.setValid(); // reset invalid state for event fire below
+-                    io.papermc.paper.plugin.lifecycle.event.LifecycleEventRunner.INSTANCE.callReloadableRegistrarEvent(io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents.COMMANDS, io.papermc.paper.command.brigadier.PaperCommands.INSTANCE, org.bukkit.plugin.Plugin.class, io.papermc.paper.plugin.lifecycle.event.registrar.ReloadableRegistrarEvent.Cause.RELOAD); // call commands event for regular plugins
+-                    final org.bukkit.craftbukkit.help.SimpleHelpMap helpMap = (org.bukkit.craftbukkit.help.SimpleHelpMap) this.server.getHelpMap();
+-                    helpMap.clear();
+-                    helpMap.initializeGeneralTopics();
+-                    helpMap.initializeCommands();
+-                    this.server.syncCommands(); // Refresh commands after event
+-                    // Paper end
+-                    new io.papermc.paper.event.server.ServerResourcesReloadedEvent(cause).callEvent(); // Paper - Add ServerResourcesReloadedEvent; fire after everything has been reloaded
++                    io.papermc.paper.threadedregions.RegionizedServer.getInstance().blockOn(() -> {
++                        io.papermc.paper.command.brigadier.PaperBrigadier.moveBukkitCommands(this.resources.managers().getCommands(), reloadableResources.managers().commands); // Paper
++                        this.resources.close();
++                        this.resources = reloadableResources;
++                        this.packRepository.setSelected(selectedIds, false); // Paper - add pendingReload flag to determine required pack loading - false as this is *after* a reload (see above)
++                        WorldDataConfiguration worldDataConfiguration = new WorldDataConfiguration(
++                            getSelectedPacks(this.packRepository, true), this.worldData.enabledFeatures()
++                        );
++                        this.worldData.setDataConfiguration(worldDataConfiguration);
++                        this.resources.managers.updateStaticRegistryTags();
++                        this.resources.managers.getRecipeManager().finalizeRecipeLoading(this.worldData.enabledFeatures());
++                        this.potionBrewing = this.potionBrewing.reload(this.worldData.enabledFeatures()); // Paper - Custom Potion Mixes
++                        // Paper start - we don't need to save everything, just advancements
++                        // this.getPlayerList().saveAll();
++                        for (final ServerPlayer player : this.getPlayerList().getPlayers()) {
++                            player.getAdvancements().save();
++                        }
++                        // Paper end - we don't need to save everything, just advancements
++                        this.getPlayerList().reloadResources();
++                        this.functionManager.replaceLibrary(this.resources.managers.getFunctionLibrary());
++                        this.structureTemplateManager.onResourceManagerReload(this.resources.resourceManager);
++                        this.fuelValues = FuelValues.vanillaBurnTimes(this.registries.compositeAccess(), this.worldData.enabledFeatures());
++                        org.bukkit.craftbukkit.block.data.CraftBlockData.reloadCache(); // Paper - cache block data strings; they can be defined by datapacks so refresh it here
++                        // Paper start - brigadier command API
++                        io.papermc.paper.command.brigadier.PaperCommands.INSTANCE.setValid(); // reset invalid state for event fire below
++                        io.papermc.paper.plugin.lifecycle.event.LifecycleEventRunner.INSTANCE.callReloadableRegistrarEvent(io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents.COMMANDS, io.papermc.paper.command.brigadier.PaperCommands.INSTANCE, org.bukkit.plugin.Plugin.class, io.papermc.paper.plugin.lifecycle.event.registrar.ReloadableRegistrarEvent.Cause.RELOAD); // call commands event for regular plugins
++                        final org.bukkit.craftbukkit.help.SimpleHelpMap helpMap = (org.bukkit.craftbukkit.help.SimpleHelpMap) this.server.getHelpMap();
++                        helpMap.clear();
++                        helpMap.initializeGeneralTopics();
++                        helpMap.initializeCommands();
++                        this.server.syncCommands(); // Refresh commands after event
++                        // Paper end
++                        new io.papermc.paper.event.server.ServerResourcesReloadedEvent(cause).callEvent(); // Paper - Add ServerResourcesReloadedEvent; fire after everything has been reloaded
++                    });
+                 },
+-                this
++                this.executor
+             );
+         if (this.isSameThread()) {
+             this.managedBlock(completableFuture::isDone);
+@@ -2725,7 +2730,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     }
+     // CraftBukkit end
+ 
+-    private ProfilerFiller createProfiler() {
++    public void beginMetricsTick() {
+         if (this.willStartRecordingMetrics) {
+             this.metricsRecorder = ActiveMetricsRecorder.createStarted(
+                 new ServerMetricsSamplersProvider(Util.timeSource, this.isDedicatedServer()),
+@@ -2742,6 +2747,10 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         }
+ 
+         this.metricsRecorder.startTick();
++    }
++
++    private ProfilerFiller createProfiler() {
++        this.beginMetricsTick();
+         return SingleTickProfiler.decorateFiller(this.metricsRecorder.getProfiler(), SingleTickProfiler.createTickProfiler("Server"));
+     }
+ 
+@@ -2824,15 +2833,28 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     }
+ 
+     public boolean isTimeProfilerRunning() {
+-        return this.debugCommandProfilerDelayStart || this.debugCommandProfiler != null;
++        return this.debugCommandProfiler != null;
+     }
+ 
+     public void startTimeProfiler() {
+-        this.debugCommandProfilerDelayStart = true;
++        this.debugCommandProfilerDelayStart = false;
++        this.debugCommandProfiler = new MinecraftServer.TimeProfiler(
++            Util.getNanos(),
++            (int)Math.min(Integer.MAX_VALUE, io.papermc.paper.threadedregions.RegionizedServer.getCurrentTick())
++        );
+     }
+ 
+     public ProfileResults stopTimeProfiler() {
+-        throw new UnsupportedOperationException(); // Folia - region threading
++        if (this.debugCommandProfiler == null) {
++            return EmptyProfileResults.EMPTY;
++        } else {
++            ProfileResults profileResults = this.debugCommandProfiler.stop(
++                Util.getNanos(),
++                (int)Math.min(Integer.MAX_VALUE, io.papermc.paper.threadedregions.RegionizedServer.getCurrentTick())
++            );
++            this.debugCommandProfiler = null;
++            return profileResults;
++        }
+     }
+ 
+     public int getMaxChainedNeighborUpdates() {
 diff --git a/net/minecraft/server/commands/BossBarCommands.java b/net/minecraft/server/commands/BossBarCommands.java
 index 983ecb4bbc7d1fb725b98cb0c6aa773e92d72fbd..0ac9cdf67f687ac50d423ffda4cf262a74437d19 100644
 --- a/net/minecraft/server/commands/BossBarCommands.java
@@ -685,10 +1047,10 @@ index 983ecb4bbc7d1fb725b98cb0c6aa773e92d72fbd..0ac9cdf67f687ac50d423ffda4cf262a
      }
  }
 diff --git a/net/minecraft/server/commands/CloneCommands.java b/net/minecraft/server/commands/CloneCommands.java
-index b2d5f2e9a4e627a007b173d422b4aada0ca39495..b2336430570c13141f4224885f1ef4938a012d45 100644
+index b2d5f2e9a4e627a007b173d422b4aada0ca39495..277e1de67afd997c48500cca434000db11f208c3 100644
 --- a/net/minecraft/server/commands/CloneCommands.java
 +++ b/net/minecraft/server/commands/CloneCommands.java
-@@ -8,8 +8,13 @@ import com.mojang.brigadier.exceptions.CommandSyntaxException;
+@@ -8,8 +8,14 @@ import com.mojang.brigadier.exceptions.CommandSyntaxException;
  import com.mojang.brigadier.exceptions.Dynamic2CommandExceptionType;
  import com.mojang.brigadier.exceptions.SimpleCommandExceptionType;
  import com.mojang.logging.LogUtils;
@@ -698,11 +1060,17 @@ index b2d5f2e9a4e627a007b173d422b4aada0ca39495..b2336430570c13141f4224885f1ef493
  import java.util.Deque;
 +import java.util.LinkedHashMap;
  import java.util.List;
++import java.util.LongSummaryStatistics;
 +import java.util.Map;
  import java.util.function.Predicate;
  import javax.annotation.Nullable;
  import net.minecraft.commands.CommandBuildContext;
-@@ -29,6 +34,7 @@ import net.minecraft.world.level.block.Blocks;
+@@ -25,13 +31,16 @@ import net.minecraft.network.chat.Component;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.util.ProblemReporter;
+ import net.minecraft.world.level.GameRules;
++import net.minecraft.world.level.block.Block;
+ import net.minecraft.world.level.block.Blocks;
  import net.minecraft.world.level.block.entity.BlockEntity;
  import net.minecraft.world.level.block.state.BlockState;
  import net.minecraft.world.level.block.state.pattern.BlockInWorld;
@@ -710,7 +1078,11 @@ index b2d5f2e9a4e627a007b173d422b4aada0ca39495..b2336430570c13141f4224885f1ef493
  import net.minecraft.world.level.levelgen.structure.BoundingBox;
  import net.minecraft.world.level.storage.TagValueInput;
  import net.minecraft.world.level.storage.TagValueOutput;
-@@ -238,16 +244,18 @@ public class CloneCommands {
++import net.minecraft.world.ticks.ScheduledTick;
+ import org.slf4j.Logger;
+ 
+ public class CloneCommands {
+@@ -238,16 +247,18 @@ public class CloneCommands {
                  Deque<BlockPos> list3 = Lists.newLinkedList();
                  int i1 = 0;
                  ProblemReporter.ScopedCollector scopedCollector = new ProblemReporter.ScopedCollector(LOGGER);
@@ -733,7 +1105,7 @@ index b2d5f2e9a4e627a007b173d422b4aada0ca39495..b2336430570c13141f4224885f1ef493
                                  BlockPos blockPos6 = blockPos5.offset(blockPos4);
                                  BlockInWorld blockInWorld = new BlockInWorld(serverLevel, blockPos5, false);
                                  BlockState state = blockInWorld.getState();
-@@ -261,32 +269,42 @@ public class CloneCommands {
+@@ -261,32 +272,42 @@ public class CloneCommands {
                                          CloneCommands.CloneBlockEntityInfo cloneBlockEntityInfo = new CloneCommands.CloneBlockEntityInfo(
                                              tagValueOutput.buildResult(), blockEntity.components()
                                          );
@@ -787,7 +1159,7 @@ index b2d5f2e9a4e627a007b173d422b4aada0ca39495..b2336430570c13141f4224885f1ef493
                          }
                      }
  
-@@ -295,39 +313,85 @@ public class CloneCommands {
+@@ -295,39 +316,84 @@ public class CloneCommands {
                      list4.addAll(list1);
                      list4.addAll(list2);
                      List<CloneCommands.CloneBlockInfo> list5 = Lists.reverse(list4);
@@ -846,7 +1218,8 @@ index b2d5f2e9a4e627a007b173d422b4aada0ca39495..b2336430570c13141f4224885f1ef493
 +                        });
 +                    }
 +                    i1 += placedBlocks[0];
-+
+ 
+-                        serverLevel1.setBlock(cloneBlockInfox.pos, cloneBlockInfox.state, z);
 +                    Map<ChunkPos, List<CloneCommands.CloneBlockInfo>> blockEntityPartitions = groupCloneInfosByChunk(list1);
 +                    for (Map.Entry<ChunkPos, List<CloneCommands.CloneBlockInfo>> entry : blockEntityPartitions.entrySet()) {
 +                        ChunkPos chunk = entry.getKey();
@@ -865,8 +1238,7 @@ index b2d5f2e9a4e627a007b173d422b4aada0ca39495..b2336430570c13141f4224885f1ef493
 +                                    blockEntity1.setComponents(info.blockEntityInfo.components);
 +                                    blockEntity1.setChanged();
 +                                }
- 
--                        serverLevel1.setBlock(cloneBlockInfox.pos, cloneBlockInfox.state, z);
++
 +                                serverLevel1.setBlock(info.pos, info.state, z);
 +                            }
 +                        });
@@ -888,13 +1260,12 @@ index b2d5f2e9a4e627a007b173d422b4aada0ca39495..b2336430570c13141f4224885f1ef493
                      }
  
 -                    serverLevel1.getBlockTicks().copyAreaFrom(serverLevel.getBlockTicks(), boundingBox, blockPos4);
-+                    CommandExecutionBridge.runOnRegion(serverLevel1, new ChunkPos(blockPos2), () -> {
-+                        serverLevel1.getBlockTicks().copyAreaFrom(serverLevel.getBlockTicks(), boundingBox, blockPos4);
-+                    });
++                    List<ScheduledTick<Block>> blockTicksToCopy = collectBlockTicks(serverLevel, boundingBox, sourcePartitions);
++                    scheduleBlockTicks(serverLevel1, blockPos4, blockTicksToCopy);
                  } catch (Throwable var35) {
                      try {
                          scopedCollector.close();
-@@ -353,7 +417,7 @@ public class CloneCommands {
+@@ -353,12 +419,82 @@ public class CloneCommands {
      record CloneBlockEntityInfo(CompoundTag tag, DataComponentMap components) {
      }
  
@@ -903,7 +1274,82 @@ index b2d5f2e9a4e627a007b173d422b4aada0ca39495..b2336430570c13141f4224885f1ef493
      }
  
      record DimensionAndPosition(ServerLevel dimension, BlockPos position) {
-@@ -374,4 +438,37 @@ public class CloneCommands {
+     }
+ 
++    private static List<ScheduledTick<Block>> collectBlockTicks(
++        ServerLevel sourceLevel,
++        BoundingBox sourceBounds,
++        Map<ChunkPos, List<BlockPos>> sourcePartitions
++    ) throws CommandSyntaxException {
++        List<ScheduledTick<Block>> collected = new ArrayList<>();
++        for (ChunkPos chunkPos : sourcePartitions.keySet()) {
++            BoundingBox clipped = clipBoundingBoxToChunk(sourceBounds, chunkPos);
++            if (clipped == null) {
++                continue;
++            }
++            BoundingBox chunkBounds = clipped;
++            List<ScheduledTick<Block>> chunkTicks = CommandExecutionBridge.callOnRegion(
++                sourceLevel,
++                chunkPos,
++                () -> sourceLevel.getBlockTicks().collectArea(chunkBounds)
++            );
++            if (!chunkTicks.isEmpty()) {
++                collected.addAll(chunkTicks);
++            }
++        }
++        return collected;
++    }
++
++    private static void scheduleBlockTicks(ServerLevel destinationLevel, BlockPos offset, List<ScheduledTick<Block>> ticks) throws CommandSyntaxException {
++        if (ticks.isEmpty()) {
++            return;
++        }
++        LongSummaryStatistics statistics = ticks.stream().mapToLong(ScheduledTick::subTickOrder).summaryStatistics();
++        long min = statistics.getMin();
++        long max = statistics.getMax();
++        Map<ChunkPos, List<ScheduledTick<Block>>> partitions = new LinkedHashMap<>();
++        for (ScheduledTick<Block> tick : ticks) {
++            BlockPos shiftedPos = tick.pos().offset(offset);
++            ScheduledTick<Block> shiftedTick = new ScheduledTick<>(
++                tick.type(),
++                shiftedPos,
++                tick.triggerTick(),
++                tick.priority(),
++                tick.subTickOrder() - min + max + 1L
++            );
++            partitions.computeIfAbsent(new ChunkPos(shiftedPos), cp -> new ArrayList<>()).add(shiftedTick);
++        }
++
++        for (Map.Entry<ChunkPos, List<ScheduledTick<Block>>> entry : partitions.entrySet()) {
++            ChunkPos chunk = entry.getKey();
++            List<ScheduledTick<Block>> chunkTicks = entry.getValue();
++            CommandExecutionBridge.runOnRegion(destinationLevel, chunk, () -> {
++                for (ScheduledTick<Block> tick : chunkTicks) {
++                    destinationLevel.getBlockTicks().schedule(tick);
++                }
++            });
++        }
++    }
++
++    @Nullable
++    private static BoundingBox clipBoundingBoxToChunk(BoundingBox bounds, ChunkPos chunkPos) {
++        int minX = Math.max(bounds.minX(), chunkPos.getMinBlockX());
++        int maxX = Math.min(bounds.maxX(), chunkPos.getMaxBlockX());
++        int minZ = Math.max(bounds.minZ(), chunkPos.getMinBlockZ());
++        int maxZ = Math.min(bounds.maxZ(), chunkPos.getMaxBlockZ());
++        if (minX > maxX || minZ > maxZ) {
++            return null;
++        }
++        return BoundingBox.fromCorners(
++            new BlockPos(minX, bounds.minY(), minZ),
++            new BlockPos(maxX, bounds.maxY(), maxZ)
++        );
++    }
++
+     static enum Mode {
+         FORCE(true),
+         MOVE(true),
+@@ -374,4 +510,37 @@ public class CloneCommands {
              return this.canOverlap;
          }
      }
@@ -1189,115 +1635,6 @@ index 3eaa9c85d06f6ecc8ed639d8befa861439390eb7..feb3527e58a1c6ec75008e70999d5af1
      }
  
      interface Inserter {
-diff --git a/net/minecraft/server/commands/DebugCommand.java b/net/minecraft/server/commands/DebugCommand.java
-index a78213464c5c365c6395fdf1295cb406c618d33b..8d6d4f7b48656a899ca62baa493ecf83716ef460 100644
---- a/net/minecraft/server/commands/DebugCommand.java
-+++ b/net/minecraft/server/commands/DebugCommand.java
-@@ -15,6 +15,7 @@ import java.nio.file.Files;
- import java.nio.file.Path;
- import java.util.Collection;
- import java.util.Locale;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import net.minecraft.Util;
- import net.minecraft.commands.CommandResultCallback;
- import net.minecraft.commands.CommandSource;
-@@ -67,32 +68,36 @@ public class DebugCommand {
-     }
- 
-     private static int start(CommandSourceStack source) throws CommandSyntaxException {
--        MinecraftServer server = source.getServer();
--        if (server.isTimeProfilerRunning()) {
--            throw ERROR_ALREADY_RUNNING.create();
--        } else {
--            server.startTimeProfiler();
--            source.sendSuccess(() -> Component.translatable("commands.debug.started"), true);
--            return 0;
--        }
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            MinecraftServer server = source.getServer();
-+            if (server.isTimeProfilerRunning()) {
-+                throw ERROR_ALREADY_RUNNING.create();
-+            } else {
-+                server.startTimeProfiler();
-+                source.sendSuccess(() -> Component.translatable("commands.debug.started"), true);
-+                return 0;
-+            }
-+        });
-     }
- 
-     private static int stop(CommandSourceStack source) throws CommandSyntaxException {
--        MinecraftServer server = source.getServer();
--        if (!server.isTimeProfilerRunning()) {
--            throw ERROR_NOT_RUNNING.create();
--        } else {
--            ProfileResults profileResults = server.stopTimeProfiler();
--            double d = (double)profileResults.getNanoDuration() / TimeUtil.NANOSECONDS_PER_SECOND;
--            double d1 = profileResults.getTickDuration() / d;
--            source.sendSuccess(
--                () -> Component.translatable(
--                    "commands.debug.stopped", String.format(Locale.ROOT, "%.2f", d), profileResults.getTickDuration(), String.format(Locale.ROOT, "%.2f", d1)
--                ),
--                true
--            );
--            return (int)d1;
--        }
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            MinecraftServer server = source.getServer();
-+            if (!server.isTimeProfilerRunning()) {
-+                throw ERROR_NOT_RUNNING.create();
-+            } else {
-+                ProfileResults profileResults = server.stopTimeProfiler();
-+                double d = (double)profileResults.getNanoDuration() / TimeUtil.NANOSECONDS_PER_SECOND;
-+                double d1 = profileResults.getTickDuration() / d;
-+                source.sendSuccess(
-+                    () -> Component.translatable(
-+                        "commands.debug.stopped", String.format(Locale.ROOT, "%.2f", d), profileResults.getTickDuration(), String.format(Locale.ROOT, "%.2f", d1)
-+                    ),
-+                    true
-+                );
-+                return (int)d1;
-+            }
-+        });
-     }
- 
-     static class TraceCustomExecutor
-diff --git a/net/minecraft/server/commands/DialogCommand.java b/net/minecraft/server/commands/DialogCommand.java
-index dc416bd06adfef055195e9f1269e80a78ea5d922..83637cea47cb3e42386e782fae546e9e95d60f72 100644
---- a/net/minecraft/server/commands/DialogCommand.java
-+++ b/net/minecraft/server/commands/DialogCommand.java
-@@ -1,6 +1,8 @@
- package net.minecraft.server.commands;
- 
- import com.mojang.brigadier.CommandDispatcher;
-+import com.mojang.brigadier.exceptions.CommandSyntaxException;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import java.util.Collection;
- import net.minecraft.commands.CommandBuildContext;
- import net.minecraft.commands.CommandSourceStack;
-@@ -44,9 +46,9 @@ public class DialogCommand {
-         );
-     }
- 
--    private static int showDialog(CommandSourceStack source, Collection<ServerPlayer> targets, Holder<Dialog> dialog) {
-+    private static int showDialog(CommandSourceStack source, Collection<ServerPlayer> targets, Holder<Dialog> dialog) throws CommandSyntaxException {
-         for (ServerPlayer serverPlayer : targets) {
--            serverPlayer.openDialog(dialog);
-+            CommandExecutionBridge.runOnEntity(serverPlayer, player -> player.openDialog(dialog));
-         }
- 
-         if (targets.size() == 1) {
-@@ -58,9 +60,9 @@ public class DialogCommand {
-         return targets.size();
-     }
- 
--    private static int clearDialog(CommandSourceStack source, Collection<ServerPlayer> targets) {
-+    private static int clearDialog(CommandSourceStack source, Collection<ServerPlayer> targets) throws CommandSyntaxException {
-         for (ServerPlayer serverPlayer : targets) {
--            serverPlayer.connection.send(ClientboundClearDialogPacket.INSTANCE);
-+            CommandExecutionBridge.runOnEntity(serverPlayer, player -> player.connection.send(ClientboundClearDialogPacket.INSTANCE));
-         }
- 
-         if (targets.size() == 1) {
 diff --git a/net/minecraft/server/commands/ExecuteCommand.java b/net/minecraft/server/commands/ExecuteCommand.java
 index 862ab68b3904873b72928463c6651aafe69c977c..a06cc5c9d4ead34bff5e7a115e36c1ccd6fb6fd3 100644
 --- a/net/minecraft/server/commands/ExecuteCommand.java
@@ -1311,99 +1648,6 @@ index 862ab68b3904873b72928463c6651aafe69c977c..a06cc5c9d4ead34bff5e7a115e36c1cc
          int containerSize = container.getContainerSize();
          IntList list = slotRange.slots();
  
-diff --git a/net/minecraft/server/commands/FunctionCommand.java b/net/minecraft/server/commands/FunctionCommand.java
-index 51fca4c3d037ae1bc4a9adc00accbdee8f223e81..c9bd95f171967bbe0b4b1ade6a07964e08113e5b 100644
---- a/net/minecraft/server/commands/FunctionCommand.java
-+++ b/net/minecraft/server/commands/FunctionCommand.java
-@@ -10,6 +10,7 @@ import com.mojang.brigadier.exceptions.Dynamic2CommandExceptionType;
- import com.mojang.brigadier.exceptions.DynamicCommandExceptionType;
- import com.mojang.brigadier.suggestion.SuggestionProvider;
- import com.mojang.datafixers.util.Pair;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import java.util.Collection;
- import javax.annotation.Nullable;
- import net.minecraft.commands.CommandResultCallback;
-@@ -49,9 +50,15 @@ public class FunctionCommand {
-         (functionId, message) -> Component.translatableEscape("commands.function.instantiationFailure", functionId, message)
-     );
-     public static final SuggestionProvider<CommandSourceStack> SUGGEST_FUNCTION = (context, suggestions) -> {
--        ServerFunctionManager functions = context.getSource().getServer().getFunctions();
--        SharedSuggestionProvider.suggestResource(functions.getTagNames(), suggestions, "#");
--        return SharedSuggestionProvider.suggestResource(functions.getFunctionNames(), suggestions);
-+        try {
-+            return CommandExecutionBridge.callOnGlobal(() -> {
-+                ServerFunctionManager functions = context.getSource().getServer().getFunctions();
-+                SharedSuggestionProvider.suggestResource(functions.getTagNames(), suggestions, "#");
-+                return SharedSuggestionProvider.suggestResource(functions.getFunctionNames(), suggestions);
-+            });
-+        } catch (CommandSyntaxException exception) {
-+            return suggestions.buildFuture();
-+        }
-     };
-     static final FunctionCommand.Callbacks<CommandSourceStack> FULL_CONTEXT_CALLBACKS = new FunctionCommand.Callbacks<CommandSourceStack>() {
-         @Override
-@@ -267,34 +274,36 @@ public class FunctionCommand {
-             ChainModifiers chainModifiers,
-             ExecutionControl<CommandSourceStack> executionControl
-         ) throws CommandSyntaxException {
--            CommandContext<CommandSourceStack> commandContext = contextChain.getTopContext().copyFor(source);
--            Pair<ResourceLocation, Collection<CommandFunction<CommandSourceStack>>> functionCollection = FunctionArgument.getFunctionCollection(
--                commandContext, "name"
--            );
--            Collection<CommandFunction<CommandSourceStack>> collection = functionCollection.getSecond();
--            if (collection.isEmpty()) {
--                throw FunctionCommand.ERROR_NO_FUNCTIONS.create(Component.translationArg(functionCollection.getFirst()));
--            } else {
--                CompoundTag compoundTag = this.arguments(commandContext);
--                CommandSourceStack commandSourceStack = FunctionCommand.modifySenderForExecution(source);
--                if (collection.size() == 1) {
--                    source.sendSuccess(
--                        () -> Component.translatable("commands.function.scheduled.single", Component.translationArg(collection.iterator().next().id())), true
--                    );
-+            CommandExecutionBridge.runOnGlobal(() -> {
-+                CommandContext<CommandSourceStack> commandContext = contextChain.getTopContext().copyFor(source);
-+                Pair<ResourceLocation, Collection<CommandFunction<CommandSourceStack>>> functionCollection = FunctionArgument.getFunctionCollection(
-+                    commandContext, "name"
-+                );
-+                Collection<CommandFunction<CommandSourceStack>> collection = functionCollection.getSecond();
-+                if (collection.isEmpty()) {
-+                    throw FunctionCommand.ERROR_NO_FUNCTIONS.create(Component.translationArg(functionCollection.getFirst()));
-                 } else {
--                    source.sendSuccess(
--                        () -> Component.translatable(
--                            "commands.function.scheduled.multiple",
--                            ComponentUtils.formatList(collection.stream().map(CommandFunction::id).toList(), Component::translationArg)
--                        ),
--                        true
-+                    CompoundTag compoundTag = this.arguments(commandContext);
-+                    CommandSourceStack commandSourceStack = FunctionCommand.modifySenderForExecution(source);
-+                    if (collection.size() == 1) {
-+                        source.sendSuccess(
-+                            () -> Component.translatable("commands.function.scheduled.single", Component.translationArg(collection.iterator().next().id())), true
-+                        );
-+                    } else {
-+                        source.sendSuccess(
-+                            () -> Component.translatable(
-+                                "commands.function.scheduled.multiple",
-+                                ComponentUtils.formatList(collection.stream().map(CommandFunction::id).toList(), Component::translationArg)
-+                            ),
-+                            true
-+                        );
-+                    }
-+
-+                    FunctionCommand.queueFunctions(
-+                        collection, compoundTag, source, commandSourceStack, executionControl, FunctionCommand.FULL_CONTEXT_CALLBACKS, chainModifiers
-                     );
-                 }
--
--                FunctionCommand.queueFunctions(
--                    collection, compoundTag, source, commandSourceStack, executionControl, FunctionCommand.FULL_CONTEXT_CALLBACKS, chainModifiers
--                );
--            }
-+            });
-         }
-     }
- }
 diff --git a/net/minecraft/server/commands/ItemCommands.java b/net/minecraft/server/commands/ItemCommands.java
 index b9a22d74e35f69c317525066f53d302aaa53da33..7c711ab7d7456ea7e52b4a3ce99be976082456b9 100644
 --- a/net/minecraft/server/commands/ItemCommands.java
@@ -1833,101 +2077,6 @@ index dce23eb45efd4f762e6bbab75abbcbf20c554bc5..0cbc8aea060cd2bb7c999dcbcee30b9c
      }
  
      private static int drop(CommandContext<CommandSourceStack> context, Holder<LootTable> lootTable, LootParams params, LootCommand.DropConsumer dropConsumer) throws CommandSyntaxException {
-diff --git a/net/minecraft/server/commands/PerfCommand.java b/net/minecraft/server/commands/PerfCommand.java
-index b10cb4a73df58a5fe64e88868733ba41616f59e4..c559180914886fb45b70853521b1791bfca8a825 100644
---- a/net/minecraft/server/commands/PerfCommand.java
-+++ b/net/minecraft/server/commands/PerfCommand.java
-@@ -9,6 +9,7 @@ import java.nio.file.Path;
- import java.nio.file.Paths;
- import java.util.Locale;
- import java.util.function.Consumer;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import net.minecraft.FileUtil;
- import net.minecraft.SharedConstants;
- import net.minecraft.SystemReport;
-@@ -42,26 +43,30 @@ public class PerfCommand {
-     }
- 
-     private static int startProfilingDedicatedServer(CommandSourceStack source) throws CommandSyntaxException {
--        MinecraftServer server = source.getServer();
--        if (server.isRecordingMetrics()) {
--            throw ERROR_ALREADY_RUNNING.create();
--        } else {
--            Consumer<ProfileResults> consumer = profileResults -> whenStopped(source, profileResults);
--            Consumer<Path> consumer1 = path -> saveResults(source, path, server);
--            server.startRecordingMetrics(consumer, consumer1);
--            source.sendSuccess(() -> Component.translatable("commands.perf.started"), false);
--            return 0;
--        }
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            MinecraftServer server = source.getServer();
-+            if (server.isRecordingMetrics()) {
-+                throw ERROR_ALREADY_RUNNING.create();
-+            } else {
-+                Consumer<ProfileResults> consumer = profileResults -> whenStopped(source, profileResults);
-+                Consumer<Path> consumer1 = path -> saveResults(source, path, server);
-+                server.startRecordingMetrics(consumer, consumer1);
-+                source.sendSuccess(() -> Component.translatable("commands.perf.started"), false);
-+                return 0;
-+            }
-+        });
-     }
- 
-     private static int stopProfilingDedicatedServer(CommandSourceStack source) throws CommandSyntaxException {
--        MinecraftServer server = source.getServer();
--        if (!server.isRecordingMetrics()) {
--            throw ERROR_NOT_RUNNING.create();
--        } else {
--            server.finishRecordingMetrics();
--            return 0;
--        }
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            MinecraftServer server = source.getServer();
-+            if (!server.isRecordingMetrics()) {
-+                throw ERROR_NOT_RUNNING.create();
-+            } else {
-+                server.finishRecordingMetrics();
-+                return 0;
-+            }
-+        });
-     }
- 
-     private static void saveResults(CommandSourceStack source, Path path, MinecraftServer server) {
-diff --git a/net/minecraft/server/commands/ReloadCommand.java b/net/minecraft/server/commands/ReloadCommand.java
-index b540a3c3a02f7242578a63477e34b9063e86f1d2..cee2f0eb9a15bf69c7f2b820c345421044bfe45f 100644
---- a/net/minecraft/server/commands/ReloadCommand.java
-+++ b/net/minecraft/server/commands/ReloadCommand.java
-@@ -4,6 +4,7 @@ import com.google.common.collect.Lists;
- import com.mojang.brigadier.CommandDispatcher;
- import com.mojang.logging.LogUtils;
- import java.util.Collection;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import net.minecraft.commands.CommandSourceStack;
- import net.minecraft.commands.Commands;
- import net.minecraft.network.chat.Component;
-@@ -48,16 +49,16 @@ public class ReloadCommand {
-     // CraftBukkit end
- 
-     public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
--        dispatcher.register(Commands.literal("reload").requires(Commands.hasPermission(2)).executes(commandContext -> {
--            CommandSourceStack commandSourceStack = commandContext.getSource();
--            MinecraftServer server = commandSourceStack.getServer();
-+        dispatcher.register(Commands.literal("reload").requires(Commands.hasPermission(2)).executes(commandContext -> CommandExecutionBridge.callOnGlobal(() -> {
-+            CommandSourceStack source = commandContext.getSource();
-+            MinecraftServer server = source.getServer();
-             PackRepository packRepository = server.getPackRepository();
-             WorldData worldData = server.getWorldData();
-             Collection<String> selectedIds = packRepository.getSelectedIds();
-             Collection<String> collection = discoverNewPacks(packRepository, worldData, selectedIds);
--            commandSourceStack.sendSuccess(() -> Component.translatable("commands.reload.success"), true);
--            reloadPacks(collection, commandSourceStack);
-+            source.sendSuccess(() -> Component.translatable("commands.reload.success"), true);
-+            reloadPacks(collection, source);
-             return 0;
--        }));
-+        })));
-     }
- }
 diff --git a/net/minecraft/server/commands/RideCommand.java b/net/minecraft/server/commands/RideCommand.java
 index 26cca2dded47d8ba55b6f797c9676c6fe03c7a42..ba8c0fb302a40372422e9c64e8bba1cbadc262f3 100644
 --- a/net/minecraft/server/commands/RideCommand.java
@@ -2034,144 +2183,6 @@ index 3c31a190687237bb3f45c30d8677e1c00dc8ed04..3cf244120e6c8ff80d8b348b46e5db5f
 +            lookAt.perform(source, target);
 +            source.sendSuccess(() -> Component.translatable("commands.rotate.success", target.getDisplayName()), true);
 +            return 1;
-+        });
-     }
- }
-diff --git a/net/minecraft/server/commands/SaveAllCommand.java b/net/minecraft/server/commands/SaveAllCommand.java
-index 15e0fce7500dc2dc2a712bf61d1d5506fd8f317a..46f508654a407d6fc98eb1660bcd6a0e256e11c2 100644
---- a/net/minecraft/server/commands/SaveAllCommand.java
-+++ b/net/minecraft/server/commands/SaveAllCommand.java
-@@ -3,6 +3,7 @@ package net.minecraft.server.commands;
- import com.mojang.brigadier.CommandDispatcher;
- import com.mojang.brigadier.exceptions.CommandSyntaxException;
- import com.mojang.brigadier.exceptions.SimpleCommandExceptionType;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import net.minecraft.commands.CommandSourceStack;
- import net.minecraft.commands.Commands;
- import net.minecraft.network.chat.Component;
-@@ -21,14 +22,16 @@ public class SaveAllCommand {
-     }
- 
-     private static int saveAll(CommandSourceStack source, boolean flush) throws CommandSyntaxException {
--        source.sendSuccess(() -> Component.translatable("commands.save.saving"), false);
--        MinecraftServer server = source.getServer();
--        boolean flag = server.saveEverything(true, flush, true);
--        if (!flag) {
--            throw ERROR_FAILED.create();
--        } else {
--            source.sendSuccess(() -> Component.translatable("commands.save.success"), true);
--            return 1;
--        }
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            source.sendSuccess(() -> Component.translatable("commands.save.saving"), false);
-+            MinecraftServer server = source.getServer();
-+            boolean flag = server.saveEverything(true, flush, true);
-+            if (!flag) {
-+                throw ERROR_FAILED.create();
-+            } else {
-+                source.sendSuccess(() -> Component.translatable("commands.save.success"), true);
-+                return 1;
-+            }
-+        });
-     }
- }
-diff --git a/net/minecraft/server/commands/ScheduleCommand.java b/net/minecraft/server/commands/ScheduleCommand.java
-index b1e84f1105b03655a4fa1d94b0e8e330e8573791..3c9860127a0139e68e3fa5affed3a24f2f63abc7 100644
---- a/net/minecraft/server/commands/ScheduleCommand.java
-+++ b/net/minecraft/server/commands/ScheduleCommand.java
-@@ -11,6 +11,7 @@ import com.mojang.datafixers.util.Either;
- import com.mojang.datafixers.util.Pair;
- import java.util.Collection;
- import java.util.Optional;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import net.minecraft.commands.CommandSourceStack;
- import net.minecraft.commands.Commands;
- import net.minecraft.commands.SharedSuggestionProvider;
-@@ -96,48 +97,52 @@ public class ScheduleCommand {
-         int time,
-         boolean append
-     ) throws CommandSyntaxException {
--        if (time == 0) {
--            throw ERROR_SAME_TICK.create();
--        } else {
--            long l = source.getLevel().getGameTime() + time;
--            ResourceLocation resourceLocation = function.getFirst();
--            TimerQueue<MinecraftServer> scheduledEvents = source.getLevel().serverLevelData.overworldData().getScheduledEvents(); // CraftBukkit - SPIGOT-6667: Use world specific function timer
--            Optional<CommandFunction<CommandSourceStack>> optional = function.getSecond().left();
--            if (optional.isPresent()) {
--                if (optional.get() instanceof MacroFunction) {
--                    throw ERROR_MACRO.create();
--                }
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            if (time == 0) {
-+                throw ERROR_SAME_TICK.create();
-+            } else {
-+                long l = source.getLevel().getGameTime() + time;
-+                ResourceLocation resourceLocation = function.getFirst();
-+                TimerQueue<MinecraftServer> scheduledEvents = source.getLevel().serverLevelData.overworldData().getScheduledEvents(); // CraftBukkit - SPIGOT-6667: Use world specific function timer
-+                Optional<CommandFunction<CommandSourceStack>> optional = function.getSecond().left();
-+                if (optional.isPresent()) {
-+                    if (optional.get() instanceof MacroFunction) {
-+                        throw ERROR_MACRO.create();
-+                    }
- 
--                String string = resourceLocation.toString();
--                if (append) {
--                    scheduledEvents.remove(string);
--                }
-+                    String string = resourceLocation.toString();
-+                    if (append) {
-+                        scheduledEvents.remove(string);
-+                    }
- 
--                scheduledEvents.schedule(string, l, new FunctionCallback(resourceLocation));
--                source.sendSuccess(
--                    () -> Component.translatable("commands.schedule.created.function", Component.translationArg(resourceLocation), time, l), true
--                );
--            } else {
--                String string = "#" + resourceLocation;
--                if (append) {
--                    scheduledEvents.remove(string);
-+                    scheduledEvents.schedule(string, l, new FunctionCallback(resourceLocation));
-+                    source.sendSuccess(
-+                        () -> Component.translatable("commands.schedule.created.function", Component.translationArg(resourceLocation), time, l), true
-+                    );
-+                } else {
-+                    String string = "#" + resourceLocation;
-+                    if (append) {
-+                        scheduledEvents.remove(string);
-+                    }
-+
-+                    scheduledEvents.schedule(string, l, new FunctionTagCallback(resourceLocation));
-+                    source.sendSuccess(() -> Component.translatable("commands.schedule.created.tag", Component.translationArg(resourceLocation), time, l), true);
-                 }
- 
--                scheduledEvents.schedule(string, l, new FunctionTagCallback(resourceLocation));
--                source.sendSuccess(() -> Component.translatable("commands.schedule.created.tag", Component.translationArg(resourceLocation), time, l), true);
-+                return Math.floorMod(l, Integer.MAX_VALUE);
-             }
--
--            return Math.floorMod(l, Integer.MAX_VALUE);
--        }
-+        });
-     }
- 
-     private static int remove(CommandSourceStack source, String function) throws CommandSyntaxException {
--        int i = source.getLevel().serverLevelData.overworldData().getScheduledEvents().remove(function); // Paper - Make schedule command per-world
--        if (i == 0) {
--            throw ERROR_CANT_REMOVE.create(function);
--        } else {
--            source.sendSuccess(() -> Component.translatable("commands.schedule.cleared.success", i, function), true);
--            return i;
--        }
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            int i = source.getLevel().serverLevelData.overworldData().getScheduledEvents().remove(function); // Paper - Make schedule command per-world
-+            if (i == 0) {
-+                throw ERROR_CANT_REMOVE.create(function);
-+            } else {
-+                source.sendSuccess(() -> Component.translatable("commands.schedule.cleared.success", i, function), true);
-+                return i;
-+            }
 +        });
      }
  }
@@ -3068,116 +3079,6 @@ index d85d3a1c52d592807c76f74c267e8eae4ebfc8e8..fa88c9abaabf08d1b52ec851c08c2631
          }
      }
  }
-diff --git a/net/minecraft/server/commands/SpreadPlayersCommand.java b/net/minecraft/server/commands/SpreadPlayersCommand.java
-index 92a820d48057ffe2ef35919341b6cdf605ca939e..c997dd8675393b07b3ddcc6933fc9e3b650f8f60 100644
---- a/net/minecraft/server/commands/SpreadPlayersCommand.java
-+++ b/net/minecraft/server/commands/SpreadPlayersCommand.java
-@@ -13,6 +13,7 @@ import java.util.Collection;
- import java.util.Locale;
- import java.util.Map;
- import java.util.Set;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import net.minecraft.commands.CommandSourceStack;
- import net.minecraft.commands.Commands;
- import net.minecraft.commands.arguments.EntityArgument;
-@@ -27,6 +28,7 @@ import net.minecraft.util.RandomSource;
- import net.minecraft.world.entity.Entity;
- import net.minecraft.world.entity.player.Player;
- import net.minecraft.world.level.BlockGetter;
-+import net.minecraft.world.level.ChunkPos;
- import net.minecraft.world.level.block.state.BlockState;
- import net.minecraft.world.phys.Vec2;
- import net.minecraft.world.scores.Team;
-@@ -228,7 +230,7 @@ public class SpreadPlayersCommand {
- 
-     private static double setPlayerPositions(
-         Collection<? extends Entity> targets, ServerLevel level, SpreadPlayersCommand.Position[] positions, int maxHeight, boolean respectTeams
--    ) {
-+    ) throws CommandSyntaxException {
-         double d = 0.0;
-         int i = 0;
-         Map<Team, SpreadPlayersCommand.Position> map = Maps.newHashMap();
-@@ -246,17 +248,22 @@ public class SpreadPlayersCommand {
-                 position = positions[i++];
-             }
- 
--            entity.teleportTo(
--                level,
--                Mth.floor(position.x) + 0.5,
--                position.getSpawnY(level, maxHeight),
--                Mth.floor(position.z) + 0.5,
--                Set.of(),
--                entity.getYRot(),
--                entity.getXRot(),
--                true
--                , org.bukkit.event.player.PlayerTeleportEvent.TeleportCause.COMMAND // CraftBukkit - handle teleport reason
--            );
-+            double targetX = Mth.floor(position.x) + 0.5;
-+            double targetZ = Mth.floor(position.z) + 0.5;
-+            double targetY = position.getSpawnY(level, maxHeight);
-+            CommandExecutionBridge.runOnEntity(entity, ent -> {
-+                ent.teleportTo(
-+                    level,
-+                    targetX,
-+                    targetY,
-+                    targetZ,
-+                    Set.of(),
-+                    ent.getYRot(),
-+                    ent.getXRot(),
-+                    true,
-+                    org.bukkit.event.player.PlayerTeleportEvent.TeleportCause.COMMAND
-+                );
-+            });
-             double d1 = Double.MAX_VALUE;
- 
-             for (SpreadPlayersCommand.Position position1 : positions) {
-@@ -288,6 +295,8 @@ public class SpreadPlayersCommand {
-         double x;
-         double z;
- 
-+        Position() {}
-+
-         double dist(SpreadPlayersCommand.Position other) {
-             double d = this.x - other.x;
-             double d1 = this.z - other.z;
-@@ -330,7 +339,11 @@ public class SpreadPlayersCommand {
-             return flag;
-         }
- 
--        public int getSpawnY(BlockGetter level, int y) {
-+        public int getSpawnY(ServerLevel level, int y) throws CommandSyntaxException {
-+            return CommandExecutionBridge.callOnRegion(level, this.chunkPos(), () -> this.getSpawnYInternal(level, y));
-+        }
-+
-+        private int getSpawnYInternal(BlockGetter level, int y) {
-             BlockPos.MutableBlockPos mutableBlockPos = new BlockPos.MutableBlockPos(this.x, (double)(y + 1), this.z);
-             boolean isAir = level.getBlockState(mutableBlockPos).isAir();
-             mutableBlockPos.move(Direction.DOWN);
-@@ -350,8 +363,12 @@ public class SpreadPlayersCommand {
-             return y + 1;
-         }
- 
--        public boolean isSafe(BlockGetter level, int y) {
--            BlockPos blockPos = BlockPos.containing(this.x, this.getSpawnY(level, y) - 1, this.z);
-+        public boolean isSafe(ServerLevel level, int y) throws CommandSyntaxException {
-+            return CommandExecutionBridge.callOnRegion(level, this.chunkPos(), () -> this.isSafeInternal(level, y));
-+        }
-+
-+        private boolean isSafeInternal(BlockGetter level, int y) {
-+            BlockPos blockPos = BlockPos.containing(this.x, this.getSpawnYInternal(level, y) - 1, this.z);
-             BlockState blockState = level.getBlockState(blockPos);
-             return blockPos.getY() < y && !blockState.liquid() && !blockState.is(BlockTags.FIRE);
-         }
-@@ -360,5 +377,9 @@ public class SpreadPlayersCommand {
-             this.x = Mth.nextDouble(random, minX, maxX);
-             this.z = Mth.nextDouble(random, minZ, maxZ);
-         }
-+
-+        private ChunkPos chunkPos() {
-+            return new ChunkPos(BlockPos.containing(this.x, 0.0, this.z));
-+        }
-     }
- }
 diff --git a/net/minecraft/server/commands/TagCommand.java b/net/minecraft/server/commands/TagCommand.java
 index c58ed8cb0ba4bb3db9777f000402c7bb0cd7bed1..8f6a3207466aceeeec97d88a49d74bb3eb664881 100644
 --- a/net/minecraft/server/commands/TagCommand.java
@@ -3665,430 +3566,6 @@ index 7db505fee0e1ec95662c2bb9b05c54daf2c362f5..b888669b08293ec9c3bfcd1b828ef2ba
 +        });
      }
  }
-diff --git a/net/minecraft/server/commands/TeamMsgCommand.java b/net/minecraft/server/commands/TeamMsgCommand.java
-index 134d7b1a9d5a5a47ebf4aabff110dde914cd6fe1..92c18bbf65767dc17f10c57ecd7c230794eb52eb 100644
---- a/net/minecraft/server/commands/TeamMsgCommand.java
-+++ b/net/minecraft/server/commands/TeamMsgCommand.java
-@@ -1,8 +1,10 @@
- package net.minecraft.server.commands;
- 
- import com.mojang.brigadier.CommandDispatcher;
-+import com.mojang.brigadier.exceptions.CommandSyntaxException;
- import com.mojang.brigadier.exceptions.SimpleCommandExceptionType;
- import com.mojang.brigadier.tree.LiteralCommandNode;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import java.util.List;
- import net.minecraft.commands.CommandSourceStack;
- import net.minecraft.commands.Commands;
-@@ -31,28 +33,28 @@ public class TeamMsgCommand {
-                 .then(
-                     Commands.argument("message", MessageArgument.message())
-                         .executes(
--                            context -> {
--                                CommandSourceStack commandSourceStack = context.getSource();
--                                Entity entityOrException = commandSourceStack.getEntityOrException();
--                                PlayerTeam team = entityOrException.getTeam();
--                                if (team == null) {
--                                    throw ERROR_NOT_ON_TEAM.create();
--                                } else {
--                                    List<ServerPlayer> list = commandSourceStack.getServer()
--                                        .getPlayerList()
--                                        .getPlayers()
--                                        .stream()
--                                        .filter(player -> player == entityOrException || player.getTeam() == team)
--                                        .toList();
--                                    if (!list.isEmpty()) {
--                                        MessageArgument.resolveChatMessage(
--                                            context, "message", message -> sendMessage(commandSourceStack, entityOrException, team, list, message)
--                                        );
-+                            context -> CommandExecutionBridge.callOnGlobal(() -> {
-+                                CommandSourceStack source = context.getSource();
-+                                Entity sender = source.getEntityOrException();
-+                                PlayerTeam team = CommandExecutionBridge.callOnEntity(sender, entity -> {
-+                                    PlayerTeam playerTeam = entity.getTeam();
-+                                    if (playerTeam == null) {
-+                                        throw ERROR_NOT_ON_TEAM.create();
-                                     }
--
--                                    return list.size();
-+                                    return playerTeam;
-+                                });
-+                                List<ServerPlayer> list = source.getServer()
-+                                    .getPlayerList()
-+                                    .getPlayers()
-+                                    .stream()
-+                                    .filter(player -> player == sender || player.getTeam() == team)
-+                                    .toList();
-+                                if (!list.isEmpty()) {
-+                                    MessageArgument.resolveChatMessage(context, "message", message -> sendMessage(source, sender, team, list, message));
-                                 }
--                            }
-+
-+                                return list.size();
-+                            })
-                         )
-                 )
-         );
-@@ -64,17 +66,30 @@ public class TeamMsgCommand {
-         ChatType.Bound bound = ChatType.bind(ChatType.TEAM_MSG_COMMAND_INCOMING, source).withTargetName(component);
-         ChatType.Bound bound1 = ChatType.bind(ChatType.TEAM_MSG_COMMAND_OUTGOING, source).withTargetName(component);
-         OutgoingChatMessage outgoingChatMessage = OutgoingChatMessage.create(chatMessage);
--        boolean flag = false;
-+        boolean[] flag = new boolean[] {false};
-+        Entity finalSender = sender;
- 
-         for (ServerPlayer serverPlayer : teamMembers) {
--            ChatType.Bound bound2 = serverPlayer == sender ? bound1 : bound;
-             boolean shouldFilterMessageTo = source.shouldFilterMessageTo(serverPlayer);
--            serverPlayer.sendChatMessage(outgoingChatMessage, shouldFilterMessageTo, bound2);
--            flag |= shouldFilterMessageTo && chatMessage.isFullyFiltered();
-+            runOnEntityUnchecked(serverPlayer, player -> {
-+                ChatType.Bound bound2 = player == finalSender ? bound1 : bound;
-+                player.sendChatMessage(outgoingChatMessage, shouldFilterMessageTo, bound2);
-+                if (shouldFilterMessageTo && chatMessage.isFullyFiltered()) {
-+                    flag[0] = true;
-+                }
-+            });
-         }
- 
--        if (flag) {
-+        if (flag[0]) {
-             source.sendSystemMessage(PlayerList.CHAT_FILTERED_FULL);
-         }
-     }
-+
-+    private static void runOnEntityUnchecked(ServerPlayer player, CommandExecutionBridge.EntityCommandRunnable<ServerPlayer> runnable) {
-+        try {
-+            CommandExecutionBridge.runOnEntity(player, runnable);
-+        } catch (CommandSyntaxException exception) {
-+            throw new RuntimeException(exception);
-+        }
-+    }
- }
-diff --git a/net/minecraft/server/commands/TickCommand.java b/net/minecraft/server/commands/TickCommand.java
-index 126685fb266692082b432ed297a499149e921dfb..424eed791d15c5701c7711144c41b8649a238fb6 100644
---- a/net/minecraft/server/commands/TickCommand.java
-+++ b/net/minecraft/server/commands/TickCommand.java
-@@ -5,6 +5,8 @@ import com.mojang.brigadier.arguments.FloatArgumentType;
- import com.mojang.brigadier.arguments.IntegerArgumentType;
- import java.util.Arrays;
- import java.util.Locale;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
-+import com.mojang.brigadier.exceptions.CommandSyntaxException;
- import net.minecraft.commands.CommandSourceStack;
- import net.minecraft.commands.Commands;
- import net.minecraft.commands.SharedSuggestionProvider;
-@@ -66,109 +68,123 @@ public class TickCommand {
-         return String.format(Locale.ROOT, "%.1f", (float)nanos / (float)TimeUtil.NANOSECONDS_PER_MILLISECOND);
-     }
- 
--    private static int setTickingRate(CommandSourceStack source, float tickRate) {
--        ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
--        serverTickRateManager.setTickRate(tickRate);
--        String string = String.format(Locale.ROOT, "%.1f", tickRate);
--        source.sendSuccess(() -> Component.translatable("commands.tick.rate.success", string), true);
--        return (int)tickRate;
-+    private static int setTickingRate(CommandSourceStack source, float tickRate) throws CommandSyntaxException {
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
-+            serverTickRateManager.setTickRate(tickRate);
-+            String string = String.format(Locale.ROOT, "%.1f", tickRate);
-+            source.sendSuccess(() -> Component.translatable("commands.tick.rate.success", string), true);
-+            return (int)tickRate;
-+        });
-     }
- 
--    private static int tickQuery(CommandSourceStack source) {
--        ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
--        String string = nanosToMilisString(source.getServer().getAverageTickTimeNanos());
--        float tickrate = serverTickRateManager.tickrate();
--        String string1 = String.format(Locale.ROOT, "%.1f", tickrate);
--        if (serverTickRateManager.isSprinting()) {
--            source.sendSuccess(() -> Component.translatable("commands.tick.status.sprinting"), false);
--            source.sendSuccess(() -> Component.translatable("commands.tick.query.rate.sprinting", string1, string), false);
--        } else {
--            if (serverTickRateManager.isFrozen()) {
--                source.sendSuccess(() -> Component.translatable("commands.tick.status.frozen"), false);
--            } else if (serverTickRateManager.nanosecondsPerTick() < source.getServer().getAverageTickTimeNanos()) {
--                source.sendSuccess(() -> Component.translatable("commands.tick.status.lagging"), false);
-+    private static int tickQuery(CommandSourceStack source) throws CommandSyntaxException {
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
-+            String string = nanosToMilisString(source.getServer().getAverageTickTimeNanos());
-+            float tickrate = serverTickRateManager.tickrate();
-+            String string1 = String.format(Locale.ROOT, "%.1f", tickrate);
-+            if (serverTickRateManager.isSprinting()) {
-+                source.sendSuccess(() -> Component.translatable("commands.tick.status.sprinting"), false);
-+                source.sendSuccess(() -> Component.translatable("commands.tick.query.rate.sprinting", string1, string), false);
-             } else {
--                source.sendSuccess(() -> Component.translatable("commands.tick.status.running"), false);
-+                if (serverTickRateManager.isFrozen()) {
-+                    source.sendSuccess(() -> Component.translatable("commands.tick.status.frozen"), false);
-+                } else if (serverTickRateManager.nanosecondsPerTick() < source.getServer().getAverageTickTimeNanos()) {
-+                    source.sendSuccess(() -> Component.translatable("commands.tick.status.lagging"), false);
-+                } else {
-+                    source.sendSuccess(() -> Component.translatable("commands.tick.status.running"), false);
-+                }
-+
-+                String string2 = nanosToMilisString(serverTickRateManager.nanosecondsPerTick());
-+                source.sendSuccess(() -> Component.translatable("commands.tick.query.rate.running", string1, string, string2), false);
-             }
- 
--            String string2 = nanosToMilisString(serverTickRateManager.nanosecondsPerTick());
--            source.sendSuccess(() -> Component.translatable("commands.tick.query.rate.running", string1, string, string2), false);
--        }
--
--        long[] longs = Arrays.copyOf(source.getServer().getTickTimesNanos(), source.getServer().getTickTimesNanos().length);
--        Arrays.sort(longs);
--        String string3 = nanosToMilisString(longs[longs.length / 2]);
--        String string4 = nanosToMilisString(longs[(int)(longs.length * 0.95)]);
--        String string5 = nanosToMilisString(longs[(int)(longs.length * 0.99)]);
--        source.sendSuccess(() -> Component.translatable("commands.tick.query.percentiles", string3, string4, string5, longs.length), false);
--        return (int)tickrate;
-+            long[] longs = Arrays.copyOf(source.getServer().getTickTimesNanos(), source.getServer().getTickTimesNanos().length);
-+            Arrays.sort(longs);
-+            String string3 = nanosToMilisString(longs[longs.length / 2]);
-+            String string4 = nanosToMilisString(longs[(int)(longs.length * 0.95)]);
-+            String string5 = nanosToMilisString(longs[(int)(longs.length * 0.99)]);
-+            source.sendSuccess(() -> Component.translatable("commands.tick.query.percentiles", string3, string4, string5, longs.length), false);
-+            return (int)tickrate;
-+        });
-     }
- 
--    private static int sprint(CommandSourceStack source, int sprintTime) {
--        boolean flag = source.getServer().tickRateManager().requestGameToSprint(sprintTime);
--        if (flag) {
--            source.sendSuccess(() -> Component.translatable("commands.tick.sprint.stop.success"), true);
--        }
-+    private static int sprint(CommandSourceStack source, int sprintTime) throws CommandSyntaxException {
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            boolean flag = source.getServer().tickRateManager().requestGameToSprint(sprintTime);
-+            if (flag) {
-+                source.sendSuccess(() -> Component.translatable("commands.tick.sprint.stop.success"), true);
-+            }
- 
--        source.sendSuccess(() -> Component.translatable("commands.tick.status.sprinting"), true);
--        return 1;
-+            source.sendSuccess(() -> Component.translatable("commands.tick.status.sprinting"), true);
-+            return 1;
-+        });
-     }
- 
--    private static int setFreeze(CommandSourceStack source, boolean frozen) {
--        ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
--        if (frozen) {
--            if (serverTickRateManager.isSprinting()) {
--                serverTickRateManager.stopSprinting();
-+    private static int setFreeze(CommandSourceStack source, boolean frozen) throws CommandSyntaxException {
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
-+            if (frozen) {
-+                if (serverTickRateManager.isSprinting()) {
-+                    serverTickRateManager.stopSprinting();
-+                }
-+
-+                if (serverTickRateManager.isSteppingForward()) {
-+                    serverTickRateManager.stopStepping();
-+                }
-             }
- 
--            if (serverTickRateManager.isSteppingForward()) {
--                serverTickRateManager.stopStepping();
-+            serverTickRateManager.setFrozen(frozen);
-+            if (frozen) {
-+                source.sendSuccess(() -> Component.translatable("commands.tick.status.frozen"), true);
-+            } else {
-+                source.sendSuccess(() -> Component.translatable("commands.tick.status.running"), true);
-             }
--        }
--
--        serverTickRateManager.setFrozen(frozen);
--        if (frozen) {
--            source.sendSuccess(() -> Component.translatable("commands.tick.status.frozen"), true);
--        } else {
--            source.sendSuccess(() -> Component.translatable("commands.tick.status.running"), true);
--        }
- 
--        return frozen ? 1 : 0;
-+            return frozen ? 1 : 0;
-+        });
-     }
- 
--    private static int step(CommandSourceStack source, int ticks) {
--        ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
--        boolean flag = serverTickRateManager.stepGameIfPaused(ticks);
--        if (flag) {
--            source.sendSuccess(() -> Component.translatable("commands.tick.step.success", ticks), true);
--        } else {
--            source.sendFailure(Component.translatable("commands.tick.step.fail"));
--        }
-+    private static int step(CommandSourceStack source, int ticks) throws CommandSyntaxException {
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
-+            boolean flag = serverTickRateManager.stepGameIfPaused(ticks);
-+            if (flag) {
-+                source.sendSuccess(() -> Component.translatable("commands.tick.step.success", ticks), true);
-+            } else {
-+                source.sendFailure(Component.translatable("commands.tick.step.fail"));
-+            }
- 
--        return 1;
-+            return 1;
-+        });
-     }
- 
--    private static int stopStepping(CommandSourceStack source) {
--        ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
--        boolean flag = serverTickRateManager.stopStepping();
--        if (flag) {
--            source.sendSuccess(() -> Component.translatable("commands.tick.step.stop.success"), true);
--            return 1;
--        } else {
--            source.sendFailure(Component.translatable("commands.tick.step.stop.fail"));
--            return 0;
--        }
-+    private static int stopStepping(CommandSourceStack source) throws CommandSyntaxException {
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
-+            boolean flag = serverTickRateManager.stopStepping();
-+            if (flag) {
-+                source.sendSuccess(() -> Component.translatable("commands.tick.step.stop.success"), true);
-+                return 1;
-+            } else {
-+                source.sendFailure(Component.translatable("commands.tick.step.stop.fail"));
-+                return 0;
-+            }
-+        });
-     }
- 
--    private static int stopSprinting(CommandSourceStack source) {
--        ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
--        boolean flag = serverTickRateManager.stopSprinting();
--        if (flag) {
--            source.sendSuccess(() -> Component.translatable("commands.tick.sprint.stop.success"), true);
--            return 1;
--        } else {
--            source.sendFailure(Component.translatable("commands.tick.sprint.stop.fail"));
--            return 0;
--        }
-+    private static int stopSprinting(CommandSourceStack source) throws CommandSyntaxException {
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ServerTickRateManager serverTickRateManager = source.getServer().tickRateManager();
-+            boolean flag = serverTickRateManager.stopSprinting();
-+            if (flag) {
-+                source.sendSuccess(() -> Component.translatable("commands.tick.sprint.stop.success"), true);
-+                return 1;
-+            } else {
-+                source.sendFailure(Component.translatable("commands.tick.sprint.stop.fail"));
-+                return 0;
-+            }
-+        });
-     }
- }
-diff --git a/net/minecraft/server/commands/TriggerCommand.java b/net/minecraft/server/commands/TriggerCommand.java
-index 60213583b19a087bc49803cdd4d46aa49db7e3be..a6d828defc478f02183de2797db9949669c62070 100644
---- a/net/minecraft/server/commands/TriggerCommand.java
-+++ b/net/minecraft/server/commands/TriggerCommand.java
-@@ -9,6 +9,7 @@ import com.mojang.brigadier.suggestion.Suggestions;
- import com.mojang.brigadier.suggestion.SuggestionsBuilder;
- import java.util.List;
- import java.util.concurrent.CompletableFuture;
-+import io.papermc.paper.threadedregions.commands.CommandExecutionBridge;
- import net.minecraft.commands.CommandSourceStack;
- import net.minecraft.commands.Commands;
- import net.minecraft.commands.SharedSuggestionProvider;
-@@ -35,7 +36,13 @@ public class TriggerCommand {
-             Commands.literal("trigger")
-                 .then(
-                     Commands.argument("objective", ObjectiveArgument.objective())
--                        .suggests((context, builder) -> suggestObjectives(context.getSource(), builder))
-+                        .suggests((context, builder) -> {
-+                            try {
-+                                return suggestObjectives(context.getSource(), builder);
-+                            } catch (CommandSyntaxException exception) {
-+                                return builder.buildFuture();
-+                            }
-+                        })
-                         .executes(
-                             context -> simpleTrigger(
-                                 context.getSource(), context.getSource().getPlayerOrException(), ObjectiveArgument.getObjective(context, "objective")
-@@ -73,44 +80,52 @@ public class TriggerCommand {
-         );
-     }
- 
--    public static CompletableFuture<Suggestions> suggestObjectives(CommandSourceStack source, SuggestionsBuilder builder) {
--        ScoreHolder entity = source.getEntity();
--        List<String> list = Lists.newArrayList();
--        if (entity != null) {
--            Scoreboard scoreboard = source.getServer().getScoreboard();
-+    public static CompletableFuture<Suggestions> suggestObjectives(CommandSourceStack source, SuggestionsBuilder builder) throws CommandSyntaxException {
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ScoreHolder entity = source.getEntity();
-+            List<String> list = Lists.newArrayList();
-+            if (entity != null) {
-+                Scoreboard scoreboard = source.getServer().getScoreboard();
- 
--            for (Objective objective : scoreboard.getObjectives()) {
--                if (objective.getCriteria() == ObjectiveCriteria.TRIGGER) {
--                    ReadOnlyScoreInfo playerScoreInfo = scoreboard.getPlayerScoreInfo(entity, objective);
--                    if (playerScoreInfo != null && !playerScoreInfo.isLocked()) {
--                        list.add(objective.getName());
-+                for (Objective objective : scoreboard.getObjectives()) {
-+                    if (objective.getCriteria() == ObjectiveCriteria.TRIGGER) {
-+                        ReadOnlyScoreInfo playerScoreInfo = scoreboard.getPlayerScoreInfo(entity, objective);
-+                        if (playerScoreInfo != null && !playerScoreInfo.isLocked()) {
-+                            list.add(objective.getName());
-+                        }
-                     }
-                 }
-             }
--        }
- 
--        return SharedSuggestionProvider.suggest(list, builder);
-+            return SharedSuggestionProvider.suggest(list, builder);
-+        });
-     }
- 
-     private static int addValue(CommandSourceStack source, ServerPlayer player, Objective objective, int value) throws CommandSyntaxException {
--        ScoreAccess score = getScore(source.getServer().getScoreboard(), player, objective);
--        int i = score.add(value);
--        source.sendSuccess(() -> Component.translatable("commands.trigger.add.success", objective.getFormattedDisplayName(), value), true);
--        return i;
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ScoreAccess score = getScore(source.getServer().getScoreboard(), player, objective);
-+            int i = score.add(value);
-+            source.sendSuccess(() -> Component.translatable("commands.trigger.add.success", objective.getFormattedDisplayName(), value), true);
-+            return i;
-+        });
-     }
- 
-     private static int setValue(CommandSourceStack source, ServerPlayer player, Objective objective, int value) throws CommandSyntaxException {
--        ScoreAccess score = getScore(source.getServer().getScoreboard(), player, objective);
--        score.set(value);
--        source.sendSuccess(() -> Component.translatable("commands.trigger.set.success", objective.getFormattedDisplayName(), value), true);
--        return value;
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ScoreAccess score = getScore(source.getServer().getScoreboard(), player, objective);
-+            score.set(value);
-+            source.sendSuccess(() -> Component.translatable("commands.trigger.set.success", objective.getFormattedDisplayName(), value), true);
-+            return value;
-+        });
-     }
- 
-     private static int simpleTrigger(CommandSourceStack source, ServerPlayer player, Objective objective) throws CommandSyntaxException {
--        ScoreAccess score = getScore(source.getServer().getScoreboard(), player, objective);
--        int i = score.add(1);
--        source.sendSuccess(() -> Component.translatable("commands.trigger.simple.success", objective.getFormattedDisplayName()), true);
--        return i;
-+        return CommandExecutionBridge.callOnGlobal(() -> {
-+            ScoreAccess score = getScore(source.getServer().getScoreboard(), player, objective);
-+            int i = score.add(1);
-+            source.sendSuccess(() -> Component.translatable("commands.trigger.simple.success", objective.getFormattedDisplayName()), true);
-+            return i;
-+        });
-     }
- 
-     private static ScoreAccess getScore(Scoreboard scoreboard, ScoreHolder scoreHolder, Objective objective) throws CommandSyntaxException {
 diff --git a/net/minecraft/server/commands/data/BlockDataAccessor.java b/net/minecraft/server/commands/data/BlockDataAccessor.java
 index 392367bd20187b5797bb5d79c234ddc5470a7b56..086103dcfa504bb1df12c5f91ee3f72330612e90 100644
 --- a/net/minecraft/server/commands/data/BlockDataAccessor.java
@@ -4312,3 +3789,52 @@ index a6de607e28f5f7c3fe977cd16b427c6f8e0fa77d..968fa0e7fde6d39dcdaebd8495944a22
 +        return this.server.getCommandStorage();
 +    }
  }
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 5e3be75b27ed609be005e8169dc84c125518253e..9c51668e8b07a23d94d3db2911b37733346fa6d0 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -891,9 +891,6 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             io.papermc.paper.threadedregions.RegionizedWorldData regionizedWorldData = this.getCurrentWorldData(); // Folia - region threading
+             long l = regionizedWorldData.getRedstoneGameTime() + 1L; // Folia - region threading
+             regionizedWorldData.setRedstoneGameTime(l); // Folia - region threading
+-            Profiler.get().push("scheduledFunctions");
+-            //this.serverLevelData.getScheduledEvents().tick(this.server, l); // Folia - region threading - TODO any way to bring this in?
+-            Profiler.get().pop();
+             if (false && this.serverLevelData.getGameRules().getBoolean(GameRules.RULE_DAYLIGHT)) {  // Folia - region threading
+                 this.setDayTime(this.levelData.getDayTime() + 1L);
+             }
+diff --git a/net/minecraft/world/TickRateManager.java b/net/minecraft/world/TickRateManager.java
+index 3dfda3c4f6554304f659079bd83a8a892af87038..b3cca5ec2c4d13350c5d7786f11d2f45d6ae9570 100644
+--- a/net/minecraft/world/TickRateManager.java
++++ b/net/minecraft/world/TickRateManager.java
+@@ -9,8 +9,8 @@ public class TickRateManager {
+     protected float tickrate = 20.0F;
+     protected long nanosecondsPerTick = TimeUtil.NANOSECONDS_PER_SECOND / 20L;
+     protected int frozenTicksToRun = 0;
+-    protected boolean runGameElements = true;
+-    protected boolean isFrozen = false;
++    protected volatile boolean runGameElements = true;
++    protected volatile boolean isFrozen = false;
+ 
+     public void setTickRate(float tickRate) {
+         this.tickrate = Math.max(tickRate, 1.0F);
+diff --git a/net/minecraft/world/ticks/LevelTicks.java b/net/minecraft/world/ticks/LevelTicks.java
+index 19c45f60f4b13bc317f7d1639fb7873862c7947b..73ab3154a7eec6d7ebeb69033f920400c31bfc14 100644
+--- a/net/minecraft/world/ticks/LevelTicks.java
++++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -328,6 +328,15 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         this.copyAreaFrom(this, area, offset);
+     }
+ 
++    public List<ScheduledTick<T>> collectArea(BoundingBox area) {
++        List<ScheduledTick<T>> list = new ArrayList<>();
++        Predicate<ScheduledTick<T>> predicate = scheduledTick -> area.isInside(scheduledTick.pos());
++        this.alreadyRunThisTick.stream().filter(predicate).forEach(list::add);
++        this.toRunThisTick.stream().filter(predicate).forEach(list::add);
++        this.forContainersInArea(area, (pos, container) -> container.getAll().filter(predicate).forEach(list::add));
++        return list;
++    }
++
+     public void copyAreaFrom(LevelTicks<T> levelTicks, BoundingBox area, Vec3i offset) {
+         List<ScheduledTick<T>> list = new ArrayList<>();
+         Predicate<ScheduledTick<T>> predicate = scheduledTick -> area.isInside(scheduledTick.pos());
