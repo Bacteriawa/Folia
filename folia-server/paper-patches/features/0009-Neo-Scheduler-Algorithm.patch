@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Bacteriawa <A3167717663@hotmail.com>
 Date: Wed, 12 Nov 2025 01:53:17 +0800
-Subject: [PATCH] New Scheduler Algorithm
+Subject: [PATCH] Neo Scheduler Algorithm
 
 
 diff --git a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java

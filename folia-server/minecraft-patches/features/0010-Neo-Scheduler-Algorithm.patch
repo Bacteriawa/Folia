@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Bacteriawa <A3167717663@hotmail.com>
-Date: Wed, 12 Nov 2025 01:53:16 +0800
-Subject: [PATCH] New Scheduler Algorithm
+Date: Tue, 18 Nov 2025 02:36:09 +0800
+Subject: [PATCH] Neo Scheduler Algorithm
 
 
 diff --git a/io/papermc/paper/threadedregions/RegionLoadBalancer.java b/io/papermc/paper/threadedregions/RegionLoadBalancer.java
@@ -64,10 +64,10 @@ index 0000000000000000000000000000000000000000..d5cf3f20e1846a93065224d0b458b606
 +    }
 +}
 diff --git a/io/papermc/paper/threadedregions/RegionizedServer.java b/io/papermc/paper/threadedregions/RegionizedServer.java
-index e1842ab8f20271a8b20ab8462b09a4745a612a9a..eb4f2beb586df1f33249aabd2ae9ac140c8f5552 100644
+index 2865ecfa743e52cf33f516883d92c5e177fdfbdc..0bb904a160c6ca648c615334db2770a828108ec2 100644
 --- a/io/papermc/paper/threadedregions/RegionizedServer.java
 +++ b/io/papermc/paper/threadedregions/RegionizedServer.java
-@@ -305,6 +305,14 @@ public final class RegionizedServer {
+@@ -320,6 +320,14 @@ public final class RegionizedServer {
  
          // scheduler
          ((FoliaGlobalRegionScheduler)Bukkit.getGlobalRegionScheduler()).tick();
@@ -82,7 +82,7 @@ index e1842ab8f20271a8b20ab8462b09a4745a612a9a..eb4f2beb586df1f33249aabd2ae9ac14
  
          // commands
          ((DedicatedServer)MinecraftServer.getServer()).handleConsoleInputs();
-@@ -344,6 +352,24 @@ public final class RegionizedServer {
+@@ -359,6 +367,24 @@ public final class RegionizedServer {
          }
      }
  
@@ -107,7 +107,7 @@ index e1842ab8f20271a8b20ab8462b09a4745a612a9a..eb4f2beb586df1f33249aabd2ae9ac14
      public static boolean isNotOwnedByGlobalRegion(final Connection conn) {
          final PacketListener packetListener = conn.getPacketListener();
  
-@@ -466,4 +492,4 @@ public final class RegionizedServer {
+@@ -481,4 +507,4 @@ public final class RegionizedServer {
      public static final record WorldLevelData(ServerLevel world, long nonRedstoneGameTime, long dayTime) {
  
      }
@@ -115,7 +115,7 @@ index e1842ab8f20271a8b20ab8462b09a4745a612a9a..eb4f2beb586df1f33249aabd2ae9ac14
 \ No newline at end of file
 +}
 diff --git a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
-index 25a0b1d56652e4455a188d0f413581638d5ef538..89baea4ad88f4650d4ad04f890f36fc5f6d1a03f 100644
+index 9c03bd36f02566d4c2ba8e298458cadf246edc46..b8d4c4ae252133e4911fdac5178a04f6fedad4e0 100644
 --- a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
 +++ b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
 @@ -8,6 +8,7 @@ import ca.spottedleaf.concurrentutil.util.Priority;
@@ -134,20 +134,20 @@ index 25a0b1d56652e4455a188d0f413581638d5ef538..89baea4ad88f4650d4ad04f890f36fc5
  
      public PrioritisedExecutor.PrioritisedTask createChunkTask(final ServerLevel world, final int chunkX, final int chunkZ,
                                                                 final Runnable run) {
-@@ -228,9 +230,11 @@ public final class RegionizedTaskQueue {
-         private final PrioritisedQueue tickTaskQueue = new PrioritisedQueue();
-         private final PrioritisedQueue chunkQueue = new PrioritisedQueue();
+@@ -234,10 +236,12 @@ public final class RegionizedTaskQueue {
+         private final PrioritisedQueue chunkQueue = new PrioritisedQueue(this);
          private final WorldRegionTaskData worldRegionTaskData;
+         private final TickRegions.TickRegionData regionData;
 +        private final long regionId;
  
--        public RegionTaskQueueData(final WorldRegionTaskData worldRegionTaskData) {
-+        public RegionTaskQueueData(final WorldRegionTaskData worldRegionTaskData, final long regionId) {
+         public RegionTaskQueueData(final WorldRegionTaskData worldRegionTaskData, final TickRegions.TickRegionData regionData) {
              this.worldRegionTaskData = worldRegionTaskData;
-+            this.regionId = regionId;
+             this.regionData = regionData;
++            this.regionId = regionData.id;
          }
  
          void mergeInto(final RegionTaskQueueData into) {
-@@ -246,6 +250,10 @@ public final class RegionizedTaskQueue {
+@@ -253,6 +257,10 @@ public final class RegionizedTaskQueue {
              return this.worldRegionTaskData.executeGlobalChunkTask() || this.chunkQueue.executeTask();
          }
  
@@ -158,7 +158,7 @@ index 25a0b1d56652e4455a188d0f413581638d5ef538..89baea4ad88f4650d4ad04f890f36fc5
          void split(final ThreadedRegionizer<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> regioniser,
                     final Long2ReferenceOpenHashMap<ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData>> into) {
              this.tickTaskQueue.split(
-@@ -813,4 +821,4 @@ public final class RegionizedTaskQueue {
+@@ -829,4 +837,4 @@ public final class RegionizedTaskQueue {
              }
          }
      }
@@ -166,10 +166,10 @@ index 25a0b1d56652e4455a188d0f413581638d5ef538..89baea4ad88f4650d4ad04f890f36fc5
 \ No newline at end of file
 +}
 diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
-index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d05b6a952 100644
+index 152166c6eb37876456fa1d981b35b87a49322d9d..bb51b0d9cdc0a38701b9b7ddb1748f8149a0aeba 100644
 --- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
 +++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
-@@ -4,6 +4,9 @@ import ca.spottedleaf.concurrentutil.scheduler.SchedulerThreadPool;
+@@ -3,6 +3,9 @@ package io.papermc.paper.threadedregions;
  import ca.spottedleaf.concurrentutil.util.TimeUtil;
  import ca.spottedleaf.moonrise.common.util.TickThread;
  import com.mojang.logging.LogUtils;
@@ -179,18 +179,18 @@ index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d
  import io.papermc.paper.util.TraceUtil;
  import net.minecraft.server.MinecraftServer;
  import net.minecraft.server.level.ServerLevel;
-@@ -41,6 +44,9 @@ public final class TickRegionScheduler {
+@@ -40,6 +43,9 @@ public final class TickRegionScheduler {
      }
      // Folia end - watchdog
  
 +    private static final SchedulerFairnessMonitor FAIRNESS_MONITOR = new SchedulerFairnessMonitor();
 +    private static final CooperativeTaskBroker COOPERATIVE_BROKER = new CooperativeTaskBroker();
 +
-     private final SchedulerThreadPool scheduler;
+     private final ScheduledTaskThreadPool scheduler;
  
-     public TickRegionScheduler(final int threads) {
-@@ -60,6 +66,14 @@ public final class TickRegionScheduler {
-         return this.scheduler.getThreads().length;
+     public TickRegionScheduler() {
+@@ -63,6 +69,14 @@ public final class TickRegionScheduler {
+         return this.scheduler.getAliveThreads().length;
      }
  
 +    public static SchedulerFairnessMonitor getFairnessMonitor() {
@@ -204,15 +204,15 @@ index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d
      private static void setTickingRegion(final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region) {
          final Thread currThread = Thread.currentThread();
          if (!(currThread instanceof TickThreadRunner tickThreadRunner)) {
-@@ -163,6 +177,7 @@ public final class TickRegionScheduler {
+@@ -166,6 +180,7 @@ public final class TickRegionScheduler {
          // To avoid acquiring any of the locks the scheduler may be using, we
          // simply cancel the next action.
          region.markNonSchedulable();
 +        region.disposeFairness();
      }
  
-     /**
-@@ -191,6 +206,17 @@ public final class TickRegionScheduler {
+     public boolean halt(final boolean sync, final long maxWaitNS) {
+@@ -189,6 +204,20 @@ public final class TickRegionScheduler {
          this.scheduler.notifyTasks(region);
      }
  
@@ -224,13 +224,16 @@ index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d
 +        if (unit == null) {
 +            throw new IllegalArgumentException("Time unit may not be null");
 +        }
++        if (runnable == null) {
++            throw new IllegalArgumentException("Runnable may not be null");
++        }
 +        COOPERATIVE_BROKER.submit(region.id, runnable, unit.toNanos(Math.max(1L, ttl)));
 +    }
 +
-     public void init() {
-         this.scheduler.start();
-     }
-@@ -255,6 +281,9 @@ public final class TickRegionScheduler {
+     private void uncaughtException(final Thread thread, final Throwable thr) {
+         LOGGER.error("Uncaught exception in tick thread \"" + thread.getName() + "\"", thr);
+ 
+@@ -249,6 +278,9 @@ public final class TickRegionScheduler {
          protected final Schedule tickSchedule;
  
          private TickRegionScheduler scheduler;
@@ -240,20 +243,19 @@ index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d
  
          public RegionScheduleHandle(final TickRegions.TickRegionData region, final long firstStart) {
              this.currentTick = 0L;
-@@ -265,9 +294,12 @@ public final class TickRegionScheduler {
+@@ -259,9 +291,11 @@ public final class TickRegionScheduler {
              this.tickTimes5m = new TickData(TimeUnit.MINUTES.toNanos(5L));
              this.tickTimes15m = new TickData(TimeUnit.MINUTES.toNanos(15L));
              this.region = region;
 +            this.taskCategory = region == null ? TaskCategory.GLOBAL : TaskCategory.REGION;
  
              this.setScheduledStart(firstStart);
-             this.tickSchedule = new Schedule(firstStart == SchedulerThreadPool.DEADLINE_NOT_SET ? firstStart : firstStart - TIME_BETWEEN_TICKS);
-+
+             this.tickSchedule = new Schedule(firstStart == ScheduledTaskThreadPool.DEADLINE_NOT_SET ? firstStart : firstStart - TIME_BETWEEN_TICKS);
 +            this.prepareInitialFairnessTicket();
          }
  
          /**
-@@ -281,6 +313,7 @@ public final class TickRegionScheduler {
+@@ -275,6 +309,7 @@ public final class TickRegionScheduler {
  
          public final void markNonSchedulable() {
              this.cancelled.set(true);
@@ -261,24 +263,45 @@ index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d
          }
  
          public final boolean isMarkedAsNonSchedulable() {
-@@ -310,6 +343,8 @@ public final class TickRegionScheduler {
+@@ -304,6 +339,8 @@ public final class TickRegionScheduler {
  
              final long cpuStart = MEASURE_CPU_TIME ? THREAD_MX_BEAN.getCurrentThreadCpuTime() : 0L;
              final long tickStart = System.nanoTime();
-+            this.beginTickFairness(tickStart);
-+            final SchedulerFairnessMonitor.FairnessTicket intermediateFairness = this.startIntermediateFairness(tickStart);
++            SchedulerFairnessMonitor.FairnessTicket intermediateFairness = null;
++            boolean fairnessActive = false;
  
              if (!this.tryMarkTicking()) {
                  if (!this.cancelled.get()) {
-@@ -355,6 +390,7 @@ public final class TickRegionScheduler {
+@@ -316,6 +353,9 @@ public final class TickRegionScheduler {
+             TickRegionScheduler.setTickTask(this);
+             if (this.region != null) {
+                 TickRegionScheduler.setTickingRegion(this.region.region);
++                this.beginTickFairness(tickStart);
++                intermediateFairness = this.startIntermediateFairness(tickStart);
++                fairnessActive = true;
+             }
+ 
+             synchronized (this) {
+@@ -348,6 +388,10 @@ public final class TickRegionScheduler {
                  );
  
                  this.addTickTime(time);
-+                this.finishIntermediateFairness(intermediateFairness, tickEnd);
++                if (fairnessActive) {
++                    this.finishIntermediateFairness(intermediateFairness, tickEnd);
++                    this.finishTickFairness(tickEnd);
++                }
                  TickRegionScheduler.setTickTask(null);
                  if (this.region != null) {
                      TickRegionScheduler.setTickingRegion(null);
-@@ -436,6 +472,7 @@ public final class TickRegionScheduler {
+@@ -387,6 +431,7 @@ public final class TickRegionScheduler {
+             TickRegionScheduler.setTickTask(this);
+             if (this.region != null) {
+                 TickRegionScheduler.setTickingRegion(this.region.region);
++                this.beginTickFairness(tickStart);
+             }
+             this.incrementTickCount();
+             final long lastTickStart = this.lastTickStart;
+@@ -429,6 +474,7 @@ public final class TickRegionScheduler {
                  );
  
                  this.addTickTime(time);
@@ -286,8 +309,8 @@ index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d
                  TickRegionScheduler.setTickTask(null);
                  if (this.region != null) {
                      TickRegionScheduler.setTickingRegion(null);
-@@ -446,6 +483,65 @@ public final class TickRegionScheduler {
-             return this.markNotTicking() && !this.cancelled.get();
+@@ -454,6 +500,67 @@ public final class TickRegionScheduler {
+             }
          }
  
 +        private void prepareInitialFairnessTicket() {
@@ -338,7 +361,9 @@ index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d
 +            if (this.region == null) {
 +                return null;
 +            }
-+            final SchedulerFairnessMonitor.FairnessTicket ticket = TickRegionScheduler.FAIRNESS_MONITOR.begin(TaskCategory.IO, this.region.id, this.fairnessWeight);
++            final SchedulerFairnessMonitor.FairnessTicket ticket = TickRegionScheduler.FAIRNESS_MONITOR.begin(
++                TaskCategory.IO, this.region.id, this.fairnessWeight
++            );
 +            TickRegionScheduler.FAIRNESS_MONITOR.markExecutionStart(ticket, startTime);
 +            return ticket;
 +        }
@@ -349,10 +374,10 @@ index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d
 +            }
 +        }
 +
-         /**
-          * Only safe to call if this tick data matches the current ticking region.
-          */
-@@ -593,4 +689,4 @@ public final class TickRegionScheduler {
+         private TickTime adjustCurrentTickData(final long tickEnd) {
+             final TickTime currentTickData = this.currentTickData;
+             if (currentTickData == null) {
+@@ -586,4 +693,4 @@ public final class TickRegionScheduler {
           * TPS: The number of ticks per second. It should be ticks / (sum of differenceFromLastTick).
           */
      }
@@ -360,10 +385,10 @@ index fa6b8d756195c1b430cc11214a901bd42eebc98d..0ce8c9c9119e82dd8171c4c80713d78d
 \ No newline at end of file
 +}
 diff --git a/io/papermc/paper/threadedregions/TickRegions.java b/io/papermc/paper/threadedregions/TickRegions.java
-index 988fe74578065c9464f5639e5cc6af79619edef5..87a50af96ef282ce626e1b4eef455fd4cc84a7bf 100644
+index 1fe996286e048cb8a8d5ede45f27792bc04fec38..d15605893cfd522a27ab130e1ac8486a1a5b1c59 100644
 --- a/io/papermc/paper/threadedregions/TickRegions.java
 +++ b/io/papermc/paper/threadedregions/TickRegions.java
-@@ -5,6 +5,8 @@ import ca.spottedleaf.concurrentutil.util.TimeUtil;
+@@ -4,6 +4,8 @@ import ca.spottedleaf.concurrentutil.util.TimeUtil;
  import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager;
  import com.mojang.logging.LogUtils;
  import io.papermc.paper.configuration.GlobalConfiguration;
@@ -372,15 +397,15 @@ index 988fe74578065c9464f5639e5cc6af79619edef5..87a50af96ef282ce626e1b4eef455fd4
  import it.unimi.dsi.fastutil.longs.Long2ReferenceMap;
  import it.unimi.dsi.fastutil.longs.Long2ReferenceOpenHashMap;
  import it.unimi.dsi.fastutil.objects.Reference2ReferenceMap;
-@@ -13,6 +15,7 @@ import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
- import net.minecraft.server.MinecraftServer;
+@@ -13,6 +15,7 @@ import net.minecraft.server.MinecraftServer;
  import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.server.level.ServerPlayer;
  import org.slf4j.Logger;
 +import java.util.ArrayList;
  import java.util.Iterator;
  import java.util.concurrent.TimeUnit;
  import java.util.concurrent.atomic.AtomicInteger;
-@@ -76,6 +79,7 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+@@ -83,6 +86,7 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
          final TickRegionData data = region.getData();
          // post-region merge/split regioninfo update
          data.getRegionStats().updateFrom(data.getOrCreateRegionizedData(data.world.worldRegionData));
@@ -388,7 +413,7 @@ index 988fe74578065c9464f5639e5cc6af79619edef5..87a50af96ef282ce626e1b4eef455fd4
      }
  
      @Override
-@@ -114,6 +118,7 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+@@ -121,6 +125,7 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
              profiler.profilerGroup.preMerge(from, into);
          }
          // Folia end - profiler
@@ -396,7 +421,7 @@ index 988fe74578065c9464f5639e5cc6af79619edef5..87a50af96ef282ce626e1b4eef455fd4
      }
  
      @Override
-@@ -125,6 +130,11 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+@@ -132,6 +137,11 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
              profiler.profilerGroup.preSplit(from, into);
          }
          // Folia end - profiler
@@ -408,16 +433,7 @@ index 988fe74578065c9464f5639e5cc6af79619edef5..87a50af96ef282ce626e1b4eef455fd4
      }
  
      public static final class TickRegionSectionData implements ThreadedRegionizer.ThreadedRegionSectionData {}
-@@ -187,7 +197,7 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
-         private TickRegionData(final ThreadedRegionizer.ThreadedRegion<TickRegionData, TickRegionSectionData> region) {
-             this.region = region;
-             this.world = region.regioniser.world;
--            this.taskQueueData = new RegionizedTaskQueue.RegionTaskQueueData(this.world.taskQueueRegionData);
-+            this.taskQueueData = new RegionizedTaskQueue.RegionTaskQueueData(this.world.taskQueueRegionData, this.id);
-             this.regionStats = new RegionStats();
-         }
- 
-@@ -345,6 +355,7 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+@@ -409,6 +419,7 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
              ret.currentTick = this.currentTick;
              ret.lastTickStart = this.lastTickStart;
              ret.tickSchedule.setLastPeriod(this.tickSchedule.getLastPeriod());
@@ -425,35 +441,29 @@ index 988fe74578065c9464f5639e5cc6af79619edef5..87a50af96ef282ce626e1b4eef455fd4
  
              return ret;
          }
-@@ -364,6 +375,7 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+@@ -428,6 +439,7 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
  
          private void copyDeadlineAndTickCount(final ConcreteRegionTickHandle from) {
              this.currentTick = from.currentTick;
 +            this.setFairnessWeight(from.getFairnessWeight());
  
-             if (from.getScheduledStart() == SchedulerThreadPool.DEADLINE_NOT_SET) {
+             if (from.getScheduledStart() == ScheduledTaskThreadPool.DEADLINE_NOT_SET) {
                  return;
-@@ -413,25 +425,48 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
-             final ca.spottedleaf.leafprofiler.RegionizedProfiler.Handle profiler = io.papermc.paper.threadedregions.TickRegionScheduler.getProfiler(); // Folia start - profiler
-             profiler.startInBetweenTick(); try { // Folia - profiler
+@@ -479,22 +491,34 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
              final RegionizedTaskQueue.RegionTaskQueueData queue = this.region.taskQueueData;
-+            final io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor monitor = TickRegionScheduler.getFairnessMonitor();
-+            final long start = System.nanoTime();
-+            final io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor.FairnessTicket tickTicket =
-+                monitor.begin(io.papermc.paper.threadedregions.scheduler.policy.TaskCategory.REGION, this.region.id, this.getFairnessWeight());
-+            final io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor.FairnessTicket ioTicket =
-+                monitor.begin(io.papermc.paper.threadedregions.scheduler.policy.TaskCategory.IO, this.region.id, this.getFairnessWeight());
-+            monitor.markExecutionStart(tickTicket, start);
-+            monitor.markExecutionStart(ioTicket, start);
  
              boolean processedChunkTask = false;
 -
--            boolean executeChunkTask = true;
--            boolean executeTickTask = true;
+-            boolean executeChunkTask;
+-            boolean executeTickTask;
+-            boolean executePacketTask;
 -            do {
--                if (executeTickTask) {
--                    executeTickTask = queue.executeTickTask();
-+            boolean processedTickTask = false;
+-                executeTickTask = queue.executeTickTask();
+-                executeChunkTask = queue.executeChunkTask();
+-                executePacketTask = this.region.drainOnePacket();
+-
+-                processedChunkTask |= executeChunkTask;
+-            } while ((executeChunkTask | executeTickTask | executePacketTask) && canContinue.getAsBoolean());
 +            final IoPriorityManager.IoHint hint = queue.evaluateIoHint();
 +            int tickBudget = hint == IoPriorityManager.IoHint.FORCE_IO ? 0 : 1;
 +            int chunkBudget = hint == IoPriorityManager.IoHint.FORCE_IO ? 2 : 1;
@@ -461,7 +471,6 @@ index 988fe74578065c9464f5639e5cc6af79619edef5..87a50af96ef282ce626e1b4eef455fd4
 +            while (canContinue.getAsBoolean()) {
 +                boolean madeProgress = false;
 +                if (tickBudget-- >= 0 && queue.executeTickTask()) {
-+                    processedTickTask = true;
 +                    madeProgress = true;
 +                }
 +                if (!madeProgress || chunkBudget-- >= 0) {
@@ -469,26 +478,20 @@ index 988fe74578065c9464f5639e5cc6af79619edef5..87a50af96ef282ce626e1b4eef455fd4
 +                        processedChunkTask = true;
 +                        madeProgress = true;
 +                    }
-                 }
--                if (executeChunkTask) {
--                    processedChunkTask |= (executeChunkTask = queue.executeChunkTask());
++                }
++                if (!madeProgress && this.region.drainOnePacket()) {
++                    madeProgress = true;
++                }
 +                if (!madeProgress) {
 +                    break;
-                 }
--            } while ((executeChunkTask | executeTickTask) && canContinue.getAsBoolean());
++                }
 +            }
-+
-+            final long end = System.nanoTime();
-+            monitor.markExecutionEnd(tickTicket, end);
-+            monitor.markExecutionEnd(ioTicket, end);
  
              if (processedChunkTask) {
                  // if we processed any chunk tasks, try to process ticket level updates for full status changes
                  this.region.world.moonrise$getChunkTaskScheduler().chunkHolderManager.processTicketUpdates();
              }
--            return true;
 +            TickRegionScheduler.getCooperativeBroker().drainTo(this.region.id, runnable -> runnable.run());
-+            return processedTickTask || processedChunkTask;
              } finally { profiler.stopInBetweenTick(); } // Folia - profiler
          }
  

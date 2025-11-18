@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Bacteriawa <A3167717663@hotmail.com>
-Date: Wed, 12 Nov 2025 22:39:59 +0800
+Date: Tue, 18 Nov 2025 17:53:38 +0800
 Subject: [PATCH] Fix Commands
 
 
@@ -87,7 +87,7 @@ index eff983882c0bce6511939f9f1f705569173eedc6..b285f9ef1fd24d7b548c3dc1d88a40b9
      public void saveAllChunksRegionised(final boolean flush, final boolean shutdown, final boolean logProgress, final boolean first, final boolean last, final boolean checkRegion) {
          final List<NewChunkHolder> holders = new java.util.ArrayList<>(this.chunkHolders.size() / 10);
 diff --git a/io/papermc/paper/threadedregions/RegionizedServer.java b/io/papermc/paper/threadedregions/RegionizedServer.java
-index eb4f2beb586df1f33249aabd2ae9ac140c8f5552..f2ec1cbdf0803cc5302b18c9e71853ff5b7989ca 100644
+index 0bb904a160c6ca648c615334db2770a828108ec2..af11a5e3345057d21c17be887029551794c562fc 100644
 --- a/io/papermc/paper/threadedregions/RegionizedServer.java
 +++ b/io/papermc/paper/threadedregions/RegionizedServer.java
 @@ -19,6 +19,8 @@ import net.minecraft.server.dedicated.DedicatedServer;
@@ -99,7 +99,7 @@ index eb4f2beb586df1f33249aabd2ae9ac140c8f5552..f2ec1cbdf0803cc5302b18c9e71853ff
  import org.bukkit.Bukkit;
  import org.slf4j.Logger;
  import java.util.ArrayList;
-@@ -72,6 +74,10 @@ public final class RegionizedServer {
+@@ -73,6 +75,10 @@ public final class RegionizedServer {
          this.lastServerStatus = 0L;
      }
  
@@ -110,7 +110,7 @@ index eb4f2beb586df1f33249aabd2ae9ac140c8f5552..f2ec1cbdf0803cc5302b18c9e71853ff
      public void addTaskWithoutNotify(final Runnable run) {
          this.globalTickQueue.add(run);
      }
-@@ -292,49 +298,68 @@ public final class RegionizedServer {
+@@ -307,49 +313,68 @@ public final class RegionizedServer {
       */
  
      private void globalTick(final int tickCount) {
@@ -215,7 +215,7 @@ index eb4f2beb586df1f33249aabd2ae9ac140c8f5552..f2ec1cbdf0803cc5302b18c9e71853ff
      }
  
      private void tickPlayerSample() {
-@@ -481,11 +506,23 @@ public final class RegionizedServer {
+@@ -496,11 +521,23 @@ public final class RegionizedServer {
      }
  
      private void tickTime(final ServerLevel world, final int tickCount) {
@@ -534,7 +534,7 @@ index ad19e9e599b26dfdb53929d9410860cb1b97698c..4b9fe0f75e6abdac01081f3437eec286
          TeleportCommand.register(this.dispatcher);
          TellRawCommand.register(this.dispatcher, context);
 diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
-index 196996aa8094bd53b61f2797b4ff3b9bcae16132..0a82ea96cf842ddd2153492608b7cf6e9fb8e288 100644
+index a2cfc25a260ee3f017e0223a4784ba9833128716..c92e5251968acf7c4f11bd53321bfe7ad6ef1e48 100644
 --- a/net/minecraft/server/MinecraftServer.java
 +++ b/net/minecraft/server/MinecraftServer.java
 @@ -1637,6 +1637,10 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
@@ -548,7 +548,7 @@ index 196996aa8094bd53b61f2797b4ff3b9bcae16132..0a82ea96cf842ddd2153492608b7cf6e
          this.server.spark.tickStart(); // Paper - spark
          new com.destroystokyo.paper.event.server.ServerTickStartEvent((int)region.getCurrentTick()).callEvent(); // Paper - Server Tick Events // Folia - region threading
          // Folia start - region threading
-@@ -2189,7 +2193,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -2190,7 +2194,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
      }
  
      public int getTickCount() {
@@ -557,7 +557,7 @@ index 196996aa8094bd53b61f2797b4ff3b9bcae16132..0a82ea96cf842ddd2153492608b7cf6e
      }
  
      public int getSpawnProtectionRadius() {
-@@ -2318,7 +2322,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -2319,7 +2323,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
          // Paper end - Add ServerResourcesReloadedEvent
          CompletableFuture<Void> completableFuture = CompletableFuture.<ImmutableList>supplyAsync(
                  () -> selectedIds.stream().map(this.packRepository::getPack).filter(Objects::nonNull).map(Pack::open).collect(ImmutableList.toImmutableList()),
@@ -566,7 +566,7 @@ index 196996aa8094bd53b61f2797b4ff3b9bcae16132..0a82ea96cf842ddd2153492608b7cf6e
              )
              .thenCompose(
                  list -> {
-@@ -2344,41 +2348,42 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -2345,41 +2349,42 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
              )
              .thenAcceptAsync(
                  reloadableResources -> {
@@ -643,7 +643,7 @@ index 196996aa8094bd53b61f2797b4ff3b9bcae16132..0a82ea96cf842ddd2153492608b7cf6e
              );
          if (this.isSameThread()) {
              this.managedBlock(completableFuture::isDone);
-@@ -2725,7 +2730,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -2726,7 +2731,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
      }
      // CraftBukkit end
  
@@ -652,7 +652,7 @@ index 196996aa8094bd53b61f2797b4ff3b9bcae16132..0a82ea96cf842ddd2153492608b7cf6e
          if (this.willStartRecordingMetrics) {
              this.metricsRecorder = ActiveMetricsRecorder.createStarted(
                  new ServerMetricsSamplersProvider(Util.timeSource, this.isDedicatedServer()),
-@@ -2742,6 +2747,10 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -2743,6 +2748,10 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
          }
  
          this.metricsRecorder.startTick();
@@ -663,7 +663,7 @@ index 196996aa8094bd53b61f2797b4ff3b9bcae16132..0a82ea96cf842ddd2153492608b7cf6e
          return SingleTickProfiler.decorateFiller(this.metricsRecorder.getProfiler(), SingleTickProfiler.createTickProfiler("Server"));
      }
  
-@@ -2824,15 +2833,28 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -2825,15 +2834,28 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
      }
  
      public boolean isTimeProfilerRunning() {
