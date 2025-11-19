@@ -165,8 +165,207 @@ index 9c03bd36f02566d4c2ba8e298458cadf246edc46..b8d4c4ae252133e4911fdac5178a04f6
 -}
 \ No newline at end of file
 +}
+diff --git a/io/papermc/paper/threadedregions/ScheduledTaskThreadPool.java b/io/papermc/paper/threadedregions/ScheduledTaskThreadPool.java
+index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd9033f0fe 100644
+--- a/io/papermc/paper/threadedregions/ScheduledTaskThreadPool.java
++++ b/io/papermc/paper/threadedregions/ScheduledTaskThreadPool.java
+@@ -2,12 +2,14 @@ package io.papermc.paper.threadedregions;
+ 
+ import ca.spottedleaf.concurrentutil.util.ConcurrentUtil;
+ import ca.spottedleaf.concurrentutil.util.TimeUtil;
++import io.papermc.paper.threadedregions.scheduler.policy.SchedulerFairnessMonitor;
+ import java.lang.invoke.VarHandle;
+ import java.util.Comparator;
+ import java.util.Iterator;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentSkipListMap;
+ import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.concurrent.locks.LockSupport;
+ import java.util.function.BooleanSupplier;
+@@ -15,6 +17,7 @@ import java.util.function.BooleanSupplier;
+ public final class ScheduledTaskThreadPool {
+ 
+     public static final long DEADLINE_NOT_SET = Long.MIN_VALUE;
++    private static final long FAIRNESS_LANE_PENALTY_NS = TimeUnit.MILLISECONDS.toNanos(2L);
+ 
+     private final ThreadFactory threadFactory;
+     private final long stealThresholdNS;
+@@ -31,6 +34,11 @@ public final class ScheduledTaskThreadPool {
+     private final ConcurrentSkipListMap<ScheduledTickTask, ScheduledTickTask> unwatchedScheduledTicks = new ConcurrentSkipListMap<>(ScheduledTickTask.TICK_COMPARATOR);
+     private final ConcurrentSkipListMap<ScheduledTickTask, ScheduledTickTask> scheduledTasks = new ConcurrentSkipListMap<>(ScheduledTickTask.TASK_COMPARATOR);
+ 
++    public interface FairlySchedulable {
++
++        SchedulerFairnessMonitor.FairnessAdvice computeFairnessAdvice(long waitNanos);
++    }
++
+     public ScheduledTaskThreadPool(final ThreadFactory threadFactory, final long stealThresholdNS,
+                                    final long taskTimeSliceNS) {
+         this.threadFactory = threadFactory;
+@@ -53,6 +61,14 @@ public final class ScheduledTaskThreadPool {
+         return first == null ? null : first.getKey();
+     }
+ 
++    private static long saturatingAdd(final long value, final long delta) {
++        final long result = value + delta;
++        if (((value ^ result) & (delta ^ result)) < 0L) {
++            return delta < 0L ? Long.MIN_VALUE : Long.MAX_VALUE;
++        }
++        return result;
++    }
++
+     private static ScheduledTickTask findFirstNonTaken(final ConcurrentSkipListMap<ScheduledTickTask, ScheduledTickTask> map) {
+         ScheduledTickTask first;
+         while ((first = firstEntry(map)) != null && first.isTaken()) {
+@@ -250,7 +266,8 @@ public final class ScheduledTaskThreadPool {
+                         // offset start by steal threshold so that it will hopefully start at its scheduled time
+                         scheduleTime - this.stealThresholdNS,
+                         hasTasks ? timeNow : DEADLINE_NOT_SET,
+-                        null
++                        null,
++                        timeNow
+                 );
+ 
+                 this.unwatchedScheduledTicks.put(task, task);
+@@ -271,7 +288,7 @@ public final class ScheduledTaskThreadPool {
+                 }
+ 
+                 final ScheduledTickTask task = tick.task = new ScheduledTickTask(
+-                    tick, scheduleTime, hasTasks ? timeNow : DEADLINE_NOT_SET, waitState.runner
++                    tick, scheduleTime, hasTasks ? timeNow : DEADLINE_NOT_SET, waitState.runner, timeNow
+                 );
+ 
+                 this.unwatchedScheduledTicks.put(task, task);
+@@ -820,22 +837,41 @@ public final class ScheduledTaskThreadPool {
+             this.waitState = null;
+         }
+ 
++        private long computeFairPriority(final ScheduledTickTask task, final long baseStart, final long now) {
++            if (!(task.tick instanceof FairlySchedulable fairTick)) {
++                return baseStart;
++            }
++            final long wait = Math.max(0L, now - task.getEnqueueTime());
++            final SchedulerFairnessMonitor.FairnessAdvice advice = fairTick.computeFairnessAdvice(wait);
++            if (advice == null) {
++                return baseStart;
++            }
++            long adjusted = saturatingAdd(baseStart, advice.startOffsetNanos());
++            if (advice.queueLevel() > 0) {
++                adjusted = saturatingAdd(adjusted, (long)advice.queueLevel() * FAIRNESS_LANE_PENALTY_NS);
++            }
++            return adjusted;
++        }
++
++        private ScheduledTickTask selectFairTask(final ScheduledTickTask globalFirst, final ScheduledTickTask ourFirst) {
++            if (globalFirst == null) {
++                return ourFirst;
++            }
++            if (ourFirst == null) {
++                return globalFirst;
++            }
++            final long now = System.nanoTime();
++            final long globalPriority = this.computeFairPriority(globalFirst, globalFirst.tickStart + this.scheduler.stealThresholdNS, now);
++            final long localPriority = this.computeFairPriority(ourFirst, ourFirst.tickStart, now);
++            return localPriority - globalPriority <= 0L ? ourFirst : globalFirst;
++        }
++
+         private ScheduledTickTask findTick() {
+             while (this.getStateVolatile() == STATE_WAITING) {
+                 final ScheduledTickTask globalFirst = findFirstNonTakenNonWatched(this.scheduler.unwatchedScheduledTicks);
+                 final ScheduledTickTask ourFirst = findFirstNonTaken(this.scheduledTicks);
+ 
+-                final ScheduledTickTask toWaitFor;
+-                if (globalFirst == null) {
+-                    toWaitFor = ourFirst;
+-                } else if (ourFirst == null) {
+-                    toWaitFor = globalFirst;
+-                } else {
+-                    final long globalStart = globalFirst.tickStart + this.scheduler.stealThresholdNS;
+-                    final long ourStart = ourFirst.tickStart;
+-
+-                    toWaitFor = ourStart - globalStart <= 0L ? ourFirst : globalFirst;
+-                }
++                final ScheduledTickTask toWaitFor = this.selectFairTask(globalFirst, ourFirst);
+ 
+                 if (toWaitFor == null) {
+                     // no tasks are scheduled
+@@ -898,13 +934,27 @@ public final class ScheduledTaskThreadPool {
+         private boolean findEarlierTask(final ScheduledTickTask task) {
+             final ScheduledTickTask globalFirst = findFirstNonTakenNonWatched(this.scheduler.unwatchedScheduledTicks);
+             final ScheduledTickTask ourFirst = findFirstNonTaken(this.scheduledTicks);
++            final long now = System.nanoTime();
++            final long reference = this.computeFairPriority(
++                task,
++                task.owner == this ? task.tickStart : task.tickStart + this.scheduler.stealThresholdNS,
++                now
++            );
+ 
+-            if (globalFirst != null && (globalFirst.tickStart + this.scheduler.stealThresholdNS) - task.tickStart < 0L) {
+-                return true;
++            if (globalFirst != null) {
++                final long globalPriority = this.computeFairPriority(
++                    globalFirst, globalFirst.tickStart + this.scheduler.stealThresholdNS, now
++                );
++                if (globalPriority - reference < 0L) {
++                    return true;
++                }
+             }
+ 
+-            if (ourFirst != null && ourFirst.tickStart - task.tickStart < 0L) {
+-                return true;
++            if (ourFirst != null) {
++                final long localPriority = this.computeFairPriority(ourFirst, ourFirst.tickStart, now);
++                if (localPriority - reference < 0L) {
++                    return true;
++                }
+             }
+ 
+             return false;
+@@ -912,7 +962,7 @@ public final class ScheduledTaskThreadPool {
+ 
+         private void reinsert(final ScheduledTickTask tick, final TickThreadRunner owner) {
+             final ScheduledTickTask newTask = tick.tick.task = new ScheduledTickTask(
+-                    tick.tick, tick.tick.getScheduledStart(), DEADLINE_NOT_SET, owner
++                    tick.tick, tick.tick.getScheduledStart(), DEADLINE_NOT_SET, owner, System.nanoTime()
+             );
+ 
+             this.scheduler.unwatchedScheduledTicks.put(newTask, newTask);
+@@ -1198,6 +1248,7 @@ public final class ScheduledTaskThreadPool {
+         private final long tickStart;
+         private long lastTaskNotify;
+         private final TickThreadRunner owner;
++        private final long enqueueTime;
+ 
+         private volatile boolean taken;
+         private static final VarHandle TAKEN_HANDLE = ConcurrentUtil.getVarHandle(ScheduledTickTask.class, "taken", boolean.class);
+@@ -1205,11 +1256,12 @@ public final class ScheduledTaskThreadPool {
+         private static final VarHandle WATCHED_HANDLE = ConcurrentUtil.getVarHandle(ScheduledTickTask.class, "watched", boolean.class);
+ 
+         private ScheduledTickTask(final SchedulableTick tick, final long tickStart, final long lastTaskNotify,
+-                                  final TickThreadRunner owner) {
++                                  final TickThreadRunner owner, final long enqueueTime) {
+             this.tick = tick;
+             this.tickStart = tickStart;
+             this.lastTaskNotify = lastTaskNotify;
+             this.owner = owner;
++            this.enqueueTime = enqueueTime;
+         }
+ 
+         public boolean take() {
+@@ -1239,5 +1291,9 @@ public final class ScheduledTaskThreadPool {
+         public void setLastTaskNotify(final long value) {
+             this.lastTaskNotify = value;
+         }
++
++        public long getEnqueueTime() {
++            return this.enqueueTime;
++        }
+     }
+ }
 diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
-index 152166c6eb37876456fa1d981b35b87a49322d9d..bb51b0d9cdc0a38701b9b7ddb1748f8149a0aeba 100644
+index 152166c6eb37876456fa1d981b35b87a49322d9d..bbe6709c0a96dc9a3a6b8bad20b9fc7725c49664 100644
 --- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
 +++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
 @@ -3,6 +3,9 @@ package io.papermc.paper.threadedregions;
@@ -233,6 +432,15 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..bb51b0d9cdc0a38701b9b7ddb1748f81
      private void uncaughtException(final Thread thread, final Throwable thr) {
          LOGGER.error("Uncaught exception in tick thread \"" + thread.getName() + "\"", thr);
  
+@@ -230,7 +259,7 @@ public final class TickRegionScheduler {
+         }
+     }
+ 
+-    public static abstract class RegionScheduleHandle extends ScheduledTaskThreadPool.SchedulableTick {
++    public static abstract class RegionScheduleHandle extends ScheduledTaskThreadPool.SchedulableTick implements ScheduledTaskThreadPool.FairlySchedulable {
+ 
+         protected long currentTick;
+         protected long lastTickStart;
 @@ -249,6 +278,9 @@ public final class TickRegionScheduler {
          protected final Schedule tickSchedule;
  
@@ -309,7 +517,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..bb51b0d9cdc0a38701b9b7ddb1748f81
                  TickRegionScheduler.setTickTask(null);
                  if (this.region != null) {
                      TickRegionScheduler.setTickingRegion(null);
-@@ -454,6 +500,67 @@ public final class TickRegionScheduler {
+@@ -454,6 +500,75 @@ public final class TickRegionScheduler {
              }
          }
  
@@ -357,6 +565,14 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..bb51b0d9cdc0a38701b9b7ddb1748f81
 +            return this.fairnessWeight;
 +        }
 +
++        @Override
++        public SchedulerFairnessMonitor.FairnessAdvice computeFairnessAdvice(final long waitNanos) {
++            if (this.taskCategory == null) {
++                return null;
++            }
++            return TickRegionScheduler.FAIRNESS_MONITOR.advise(this.taskCategory, this.fairnessWeight, waitNanos);
++        }
++
 +        private SchedulerFairnessMonitor.FairnessTicket startIntermediateFairness(final long startTime) {
 +            if (this.region == null) {
 +                return null;
@@ -377,7 +593,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..bb51b0d9cdc0a38701b9b7ddb1748f81
          private TickTime adjustCurrentTickData(final long tickEnd) {
              final TickTime currentTickData = this.currentTickData;
              if (currentTickData == null) {
-@@ -586,4 +693,4 @@ public final class TickRegionScheduler {
+@@ -586,4 +701,4 @@ public final class TickRegionScheduler {
           * TPS: The number of ticks per second. It should be ticks / (sum of differenceFromLastTick).
           */
      }
