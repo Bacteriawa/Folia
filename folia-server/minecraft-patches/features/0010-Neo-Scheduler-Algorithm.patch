@@ -64,10 +64,32 @@ index 0000000000000000000000000000000000000000..d5cf3f20e1846a93065224d0b458b606
 +    }
 +}
 diff --git a/io/papermc/paper/threadedregions/RegionizedServer.java b/io/papermc/paper/threadedregions/RegionizedServer.java
-index 2865ecfa743e52cf33f516883d92c5e177fdfbdc..0bb904a160c6ca648c615334db2770a828108ec2 100644
+index 2865ecfa743e52cf33f516883d92c5e177fdfbdc..5f59ec5f0145494f83304f54e71b290860fa9f75 100644
 --- a/io/papermc/paper/threadedregions/RegionizedServer.java
 +++ b/io/papermc/paper/threadedregions/RegionizedServer.java
-@@ -320,6 +320,14 @@ public final class RegionizedServer {
+@@ -1,11 +1,10 @@
+ package io.papermc.paper.threadedregions;
+ 
+-import ca.spottedleaf.concurrentutil.collection.MultiThreadedQueue;
+ import ca.spottedleaf.concurrentutil.completable.Completable;
+-import ca.spottedleaf.concurrentutil.scheduler.SchedulerThreadPool;
+ import ca.spottedleaf.moonrise.common.util.TickThread;
+ import com.mojang.logging.LogUtils;
+ import io.papermc.paper.threadedregions.scheduler.FoliaGlobalRegionScheduler;
++import io.papermc.paper.threadedregions.scheduler.queue.LockFreeTaskQueue;
+ import net.minecraft.CrashReport;
+ import net.minecraft.ReportedException;
+ import net.minecraft.network.Connection;
+@@ -39,7 +38,7 @@ public final class RegionizedServer {
+     private final CopyOnWriteArrayList<ServerLevel> worlds = new CopyOnWriteArrayList<>();
+     private final CopyOnWriteArrayList<Connection> connections = new CopyOnWriteArrayList<>();
+ 
+-    private final MultiThreadedQueue<Runnable> globalTickQueue = new MultiThreadedQueue<>();
++    private final LockFreeTaskQueue<Runnable> globalTickQueue = new LockFreeTaskQueue<>(1024);
+ 
+     private final GlobalTickTickHandle tickHandle = new GlobalTickTickHandle(this);
+ 
+@@ -320,6 +319,14 @@ public final class RegionizedServer {
  
          // scheduler
          ((FoliaGlobalRegionScheduler)Bukkit.getGlobalRegionScheduler()).tick();
@@ -82,7 +104,7 @@ index 2865ecfa743e52cf33f516883d92c5e177fdfbdc..0bb904a160c6ca648c615334db2770a8
  
          // commands
          ((DedicatedServer)MinecraftServer.getServer()).handleConsoleInputs();
-@@ -359,6 +367,24 @@ public final class RegionizedServer {
+@@ -359,6 +366,24 @@ public final class RegionizedServer {
          }
      }
  
@@ -107,7 +129,7 @@ index 2865ecfa743e52cf33f516883d92c5e177fdfbdc..0bb904a160c6ca648c615334db2770a8
      public static boolean isNotOwnedByGlobalRegion(final Connection conn) {
          final PacketListener packetListener = conn.getPacketListener();
  
-@@ -481,4 +507,4 @@ public final class RegionizedServer {
+@@ -481,4 +506,4 @@ public final class RegionizedServer {
      public static final record WorldLevelData(ServerLevel world, long nonRedstoneGameTime, long dayTime) {
  
      }
@@ -1161,5 +1183,48 @@ index 0000000000000000000000000000000000000000..d4feba486729d3f9ca65b10eae14977e
 +
 +    public boolean isRegionLocal() {
 +        return this.regionLocal;
++    }
++}
+diff --git a/io/papermc/paper/threadedregions/scheduler/queue/LockFreeTaskQueue.java b/io/papermc/paper/threadedregions/scheduler/queue/LockFreeTaskQueue.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1a8a574bcd827cf0212a165dda37a599eacfbd7
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/scheduler/queue/LockFreeTaskQueue.java
+@@ -0,0 +1,37 @@
++package io.papermc.paper.threadedregions.scheduler.queue;
++
++import org.jctools.queues.MpscUnboundedArrayQueue;
++
++/**
++ * Small wrapper around JCTools' lock-free MPSC queue so callers do not need to depend on the
++ * third-party API directly. This queue is unbounded and optimized for scenarios where many
++ * producer threads enqueue short tasks that a single region scheduler thread drains.
++ */
++public final class LockFreeTaskQueue<T> {
++
++    private final MpscUnboundedArrayQueue<T> queue;
++
++    public LockFreeTaskQueue(final int initialChunkSize) {
++        // MpscUnboundedArrayQueue requires the chunk size to be a power of two >= 2
++        final int normalizedSize = Math.max(4, Integer.highestOneBit(initialChunkSize - 1) << 1);
++        this.queue = new MpscUnboundedArrayQueue<>(normalizedSize);
++    }
++
++    public void add(final T value) {
++        if (value == null) {
++            throw new NullPointerException("value");
++        }
++        // The queue is unbounded, but offer can still return false while resizing; spin briefly.
++        while (!this.queue.offer(value)) {
++            Thread.onSpinWait();
++        }
++    }
++
++    public T poll() {
++        return this.queue.poll();
++    }
++
++    public boolean isEmpty() {
++        return this.queue.isEmpty();
 +    }
 +}
