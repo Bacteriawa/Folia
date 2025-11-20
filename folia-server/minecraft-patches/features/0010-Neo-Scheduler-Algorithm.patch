@@ -166,10 +166,10 @@ index 9c03bd36f02566d4c2ba8e298458cadf246edc46..b8d4c4ae252133e4911fdac5178a04f6
 \ No newline at end of file
 +}
 diff --git a/io/papermc/paper/threadedregions/ScheduledTaskThreadPool.java b/io/papermc/paper/threadedregions/ScheduledTaskThreadPool.java
-index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd9033f0fe 100644
+index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..7dee27980d984fc36391c4d7ef028dba0bb4eb64 100644
 --- a/io/papermc/paper/threadedregions/ScheduledTaskThreadPool.java
 +++ b/io/papermc/paper/threadedregions/ScheduledTaskThreadPool.java
-@@ -2,12 +2,14 @@ package io.papermc.paper.threadedregions;
+@@ -2,12 +2,15 @@ package io.papermc.paper.threadedregions;
  
  import ca.spottedleaf.concurrentutil.util.ConcurrentUtil;
  import ca.spottedleaf.concurrentutil.util.TimeUtil;
@@ -181,30 +181,61 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
  import java.util.concurrent.ConcurrentSkipListMap;
  import java.util.concurrent.ThreadFactory;
 +import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
  import java.util.concurrent.atomic.AtomicLong;
  import java.util.concurrent.locks.LockSupport;
  import java.util.function.BooleanSupplier;
-@@ -15,6 +17,7 @@ import java.util.function.BooleanSupplier;
+@@ -15,10 +18,11 @@ import java.util.function.BooleanSupplier;
  public final class ScheduledTaskThreadPool {
  
      public static final long DEADLINE_NOT_SET = Long.MIN_VALUE;
 +    private static final long FAIRNESS_LANE_PENALTY_NS = TimeUnit.MILLISECONDS.toNanos(2L);
  
      private final ThreadFactory threadFactory;
-     private final long stealThresholdNS;
-@@ -31,6 +34,11 @@ public final class ScheduledTaskThreadPool {
+-    private final long stealThresholdNS;
+-    private final long taskTimeSliceNS;
++    private volatile long stealThresholdNS;
++    private volatile long taskTimeSliceNS;
+ 
+     private final COWArrayList<TickThreadRunner> coreThreads = new COWArrayList<>(TickThreadRunner.class);
+     private final COWArrayList<TickThreadRunner> aliveThreads = new COWArrayList<>(TickThreadRunner.class);
+@@ -30,6 +34,35 @@ public final class ScheduledTaskThreadPool {
+ 
      private final ConcurrentSkipListMap<ScheduledTickTask, ScheduledTickTask> unwatchedScheduledTicks = new ConcurrentSkipListMap<>(ScheduledTickTask.TICK_COMPARATOR);
      private final ConcurrentSkipListMap<ScheduledTickTask, ScheduledTickTask> scheduledTasks = new ConcurrentSkipListMap<>(ScheduledTickTask.TASK_COMPARATOR);
- 
++    private final AtomicInteger queuedScheduledTicks = new AtomicInteger();
++    private volatile AutoScalingConfig autoScalingConfig;
++    private volatile long lastScaleDownDecision = System.nanoTime();
++
 +    public interface FairlySchedulable {
 +
 +        SchedulerFairnessMonitor.FairnessAdvice computeFairnessAdvice(long waitNanos);
 +    }
 +
++    private static final class AutoScalingConfig {
++
++        private final int minThreads;
++        private final int maxThreads;
++        private final int scaleStep;
++        private final int backlogScaleThreshold;
++        private final int idleShrinkThreshold;
++        private final long idleCooldownNanos;
++
++        private AutoScalingConfig(final int minThreads, final int maxThreads, final int scaleStep,
++                                  final int backlogScaleThreshold, final int idleShrinkThreshold,
++                                  final long idleCooldownNanos) {
++            this.minThreads = minThreads;
++            this.maxThreads = maxThreads;
++            this.scaleStep = scaleStep;
++            this.backlogScaleThreshold = backlogScaleThreshold;
++            this.idleShrinkThreshold = idleShrinkThreshold;
++            this.idleCooldownNanos = idleCooldownNanos;
++        }
++    }
+ 
      public ScheduledTaskThreadPool(final ThreadFactory threadFactory, final long stealThresholdNS,
                                     final long taskTimeSliceNS) {
-         this.threadFactory = threadFactory;
-@@ -53,6 +61,14 @@ public final class ScheduledTaskThreadPool {
+@@ -53,6 +86,14 @@ public final class ScheduledTaskThreadPool {
          return first == null ? null : first.getKey();
      }
  
@@ -219,7 +250,141 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
      private static ScheduledTickTask findFirstNonTaken(final ConcurrentSkipListMap<ScheduledTickTask, ScheduledTickTask> map) {
          ScheduledTickTask first;
          while ((first = firstEntry(map)) != null && first.isTaken()) {
-@@ -250,7 +266,8 @@ public final class ScheduledTaskThreadPool {
+@@ -221,19 +262,131 @@ public final class ScheduledTaskThreadPool {
+     }
+ 
+     private void interruptAllRunners() {
+-        for (final TickThreadRunner runner : this.coreThreads.getArray()) {
++        for (final TickThreadRunner runner : this.aliveThreads.getArray()) {
+             runner.interrupt();
+         }
+     }
+ 
++    public void configureAutoScaling(final int minThreads, final int maxThreads, final int scaleStep,
++                                     final int backlogScaleThreshold, final long idleCooldownMillis) {
++        if (minThreads <= 0) {
++            throw new IllegalArgumentException("minThreads must be > 0");
++        }
++        if (maxThreads < minThreads) {
++            throw new IllegalArgumentException("maxThreads must be >= minThreads");
++        }
++        if (scaleStep <= 0) {
++            throw new IllegalArgumentException("scaleStep must be > 0");
++        }
++        if (backlogScaleThreshold <= 0) {
++            throw new IllegalArgumentException("backlogScaleThreshold must be > 0");
++        }
++        if (idleCooldownMillis < 0L) {
++            throw new IllegalArgumentException("idleCooldownMillis must be >= 0");
++        }
++        final int idleShrinkThreshold = Math.max(1, backlogScaleThreshold / 4);
++        this.autoScalingConfig = new AutoScalingConfig(
++            minThreads, maxThreads, scaleStep, backlogScaleThreshold, idleShrinkThreshold,
++            TimeUnit.MILLISECONDS.toNanos(idleCooldownMillis)
++        );
++        this.lastScaleDownDecision = System.nanoTime();
++    }
++
++    public int getApproximateBacklog() {
++        final int queued = this.queuedScheduledTicks.get();
++        return queued < 0 ? 0 : queued;
++    }
++
++    public void updateTimingParameters(final long stealThresholdNS, final long taskTimeSliceNS) {
++        if (stealThresholdNS < 0L) {
++            throw new IllegalArgumentException("Steal threshold must be >= 0");
++        }
++        if (taskTimeSliceNS <= 0L) {
++            throw new IllegalArgumentException("Task time slice must be > 0");
++        }
++        this.stealThresholdNS = stealThresholdNS;
++        this.taskTimeSliceNS = taskTimeSliceNS;
++    }
++
++    private boolean interruptIdleRunner() {
++        for (;;) {
++            final WaitState waiter = firstEntry(this.waitingOrIdleRunners);
++            if (waiter == null) {
++                return false;
++            }
++            if (this.waitingOrIdleRunners.remove(waiter) == null) {
++                continue;
++            }
++            if (waiter.runner.interrupt()) {
++                return true;
++            }
++        }
++    }
++
+     private void interruptOneRunner() {
+-        for (final TickThreadRunner runner : this.coreThreads.getArray()) {
++        if (this.interruptIdleRunner()) {
++            return;
++        }
++        for (final TickThreadRunner runner : this.aliveThreads.getArray()) {
+             if (runner.interrupt()) {
+                 return;
+             }
+         }
+     }
+ 
++    private void onTaskEnqueued() {
++        final int queued = this.queuedScheduledTicks.incrementAndGet();
++        final AutoScalingConfig config = this.autoScalingConfig;
++        if (config == null) {
++            return;
++        }
++        if (queued < config.backlogScaleThreshold) {
++            return;
++        }
++        if (!this.waitingOrIdleRunners.isEmpty()) {
++            return;
++        }
++        final int currentThreads = this.coreThreads.getArray().length;
++        if (currentThreads >= config.maxThreads) {
++            return;
++        }
++        final int target = Math.min(config.maxThreads, currentThreads + config.scaleStep);
++        this.setCoreThreads(Math.max(config.minThreads, target));
++    }
++
++    private void onTaskDequeued() {
++        this.queuedScheduledTicks.updateAndGet((final int prev) -> Math.max(0, prev - 1));
++    }
++
++    private void maybeScaleDownOnIdle() {
++        final AutoScalingConfig config = this.autoScalingConfig;
++        if (config == null) {
++            return;
++        }
++        if (this.getApproximateBacklog() > config.idleShrinkThreshold) {
++            this.lastScaleDownDecision = System.nanoTime();
++            return;
++        }
++        final long now = System.nanoTime();
++        if (now - this.lastScaleDownDecision < config.idleCooldownNanos) {
++            return;
++        }
++        final TickThreadRunner[] current = this.coreThreads.getArray();
++        if (current.length <= config.minThreads) {
++            return;
++        }
++        if (this.waitingOrIdleRunners.size() < current.length) {
++            return;
++        }
++        final int target = Math.max(config.minThreads, current.length - config.scaleStep);
++        this.setCoreThreads(target);
++        this.lastScaleDownDecision = now;
++    }
++
++    void onRunnerIdle() {
++        this.maybeScaleDownOnIdle();
++    }
++
+     private void insert(final SchedulableTick tick, final boolean hasTasks) {
+         final long scheduleTime = tick.getScheduledStart();
+         final long timeNow = System.nanoTime();
+@@ -250,13 +403,15 @@ public final class ScheduledTaskThreadPool {
                          // offset start by steal threshold so that it will hopefully start at its scheduled time
                          scheduleTime - this.stealThresholdNS,
                          hasTasks ? timeNow : DEADLINE_NOT_SET,
@@ -229,7 +394,14 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
                  );
  
                  this.unwatchedScheduledTicks.put(task, task);
-@@ -271,7 +288,7 @@ public final class ScheduledTaskThreadPool {
+                 if (hasTasks) {
+                     this.scheduledTasks.put(task, task);
+                 }
++                this.onTaskEnqueued();
+ 
+                 if (!this.waitingOrIdleRunners.isEmpty()) {
+                     // handle race condition: all threads went to sleep since we checked
+@@ -271,7 +426,7 @@ public final class ScheduledTaskThreadPool {
                  }
  
                  final ScheduledTickTask task = tick.task = new ScheduledTickTask(
@@ -238,7 +410,23 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
                  );
  
                  this.unwatchedScheduledTicks.put(task, task);
-@@ -820,22 +837,41 @@ public final class ScheduledTaskThreadPool {
+@@ -280,6 +435,7 @@ public final class ScheduledTaskThreadPool {
+                     this.scheduledTasks.put(task, task);
+                     waitState.runner.scheduledTasks.put(task, task);
+                 }
++                this.onTaskEnqueued();
+ 
+                 if (!waitState.runner.interrupt() && waitState.runner.isHalted()) {
+                     // handle race condition: runner we selected was halted
+@@ -353,6 +509,7 @@ public final class ScheduledTaskThreadPool {
+         if (task != null && task.take()) {
+             this.unwatchedScheduledTicks.remove(task);
+             this.scheduledTasks.remove(task);
++            this.onTaskDequeued();
+             final TickThreadRunner owner = task.owner;
+             if (owner != null) {
+                 owner.scheduledTicks.remove(task);
+@@ -820,22 +977,41 @@ public final class ScheduledTaskThreadPool {
              this.waitState = null;
          }
  
@@ -291,7 +479,15 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
  
                  if (toWaitFor == null) {
                      // no tasks are scheduled
-@@ -898,13 +934,27 @@ public final class ScheduledTaskThreadPool {
+@@ -848,6 +1024,7 @@ public final class ScheduledTaskThreadPool {
+                         this.interrupt();
+                     }
+ 
++                    this.scheduler.onRunnerIdle();
+                     return toWaitFor;
+                 }
+ 
+@@ -898,13 +1075,27 @@ public final class ScheduledTaskThreadPool {
          private boolean findEarlierTask(final ScheduledTickTask task) {
              final ScheduledTickTask globalFirst = findFirstNonTakenNonWatched(this.scheduler.unwatchedScheduledTicks);
              final ScheduledTickTask ourFirst = findFirstNonTaken(this.scheduledTicks);
@@ -323,7 +519,7 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
              }
  
              return false;
-@@ -912,7 +962,7 @@ public final class ScheduledTaskThreadPool {
+@@ -912,13 +1103,14 @@ public final class ScheduledTaskThreadPool {
  
          private void reinsert(final ScheduledTickTask tick, final TickThreadRunner owner) {
              final ScheduledTickTask newTask = tick.tick.task = new ScheduledTickTask(
@@ -332,7 +528,30 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
              );
  
              this.scheduler.unwatchedScheduledTicks.put(newTask, newTask);
-@@ -1198,6 +1248,7 @@ public final class ScheduledTaskThreadPool {
+             if (owner != null) {
+                 owner.scheduledTicks.put(newTask, newTask);
+             }
++            this.scheduler.onTaskEnqueued();
+ 
+             if (newTask.tick.hasTasks()) {
+                 this.scheduler.notifyTasks(newTask.tick);
+@@ -935,6 +1127,7 @@ public final class ScheduledTaskThreadPool {
+                 this.compareAndExchangeStateVolatile(STATE_TASKS, STATE_WAITING);
+                 return;
+             }
++            this.scheduler.onTaskDequeued();
+ 
+             // remove from queues
+             this.scheduler.unwatchedScheduledTicks.remove(tick);
+@@ -1009,6 +1202,7 @@ public final class ScheduledTaskThreadPool {
+                     if (!tick.take()) {
+                         continue;
+                     }
++                    this.scheduler.onTaskDequeued();
+                     this.cleanWaitState();
+                     return tick;
+                 }
+@@ -1198,6 +1392,7 @@ public final class ScheduledTaskThreadPool {
          private final long tickStart;
          private long lastTaskNotify;
          private final TickThreadRunner owner;
@@ -340,7 +559,7 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
  
          private volatile boolean taken;
          private static final VarHandle TAKEN_HANDLE = ConcurrentUtil.getVarHandle(ScheduledTickTask.class, "taken", boolean.class);
-@@ -1205,11 +1256,12 @@ public final class ScheduledTaskThreadPool {
+@@ -1205,11 +1400,12 @@ public final class ScheduledTaskThreadPool {
          private static final VarHandle WATCHED_HANDLE = ConcurrentUtil.getVarHandle(ScheduledTickTask.class, "watched", boolean.class);
  
          private ScheduledTickTask(final SchedulableTick tick, final long tickStart, final long lastTaskNotify,
@@ -354,7 +573,16 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
          }
  
          public boolean take() {
-@@ -1239,5 +1291,9 @@ public final class ScheduledTaskThreadPool {
+@@ -1229,7 +1425,7 @@ public final class ScheduledTaskThreadPool {
+         }
+ 
+         public boolean isWatched() {
+-            return (boolean)TAKEN_HANDLE.getVolatile(this);
++            return (boolean)WATCHED_HANDLE.getVolatile(this);
+         }
+ 
+         public long getLastTaskNotify() {
+@@ -1239,5 +1435,9 @@ public final class ScheduledTaskThreadPool {
          public void setLastTaskNotify(final long value) {
              this.lastTaskNotify = value;
          }
@@ -365,7 +593,7 @@ index 5c591b0d6eac45d6094ce44bf62ad976bf995e66..f6ed841af302868f3b634c5d9ead8ffd
      }
  }
 diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
-index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec0d51c034 100644
+index 152166c6eb37876456fa1d981b35b87a49322d9d..bf2922f2b24f9b3de6b8df90bdabd7c136e630f2 100644
 --- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
 +++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
 @@ -3,6 +3,9 @@ package io.papermc.paper.threadedregions;
@@ -388,7 +616,28 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
      private final ScheduledTaskThreadPool scheduler;
  
      public TickRegionScheduler() {
-@@ -63,6 +69,14 @@ public final class TickRegionScheduler {
+@@ -56,13 +62,35 @@ public final class TickRegionScheduler {
+     }
+ 
+     public void setThreads(final int threads) {
++        if (threads <= 0) {
++            throw new IllegalArgumentException("Thread count must be > 0");
++        }
+         this.scheduler.setCoreThreads(threads);
++        final int minThreads = Math.max(1, threads);
++        final int maxThreads = Math.max(minThreads, minThreads * 4);
++        final int scaleStep = Math.max(1, minThreads / 2);
++        final int backlogThreshold = Math.max(32, minThreads * 8);
++        this.scheduler.configureAutoScaling(minThreads, maxThreads, scaleStep, backlogThreshold, 15_000L);
++        final long stealMs = Math.max(1L, 3L - minThreads / 32L);
++        final long sliceMs = Math.max(1L, 2L - minThreads / 48L);
++        this.scheduler.updateTimingParameters(
++            TimeUnit.MILLISECONDS.toNanos(stealMs),
++            TimeUnit.MILLISECONDS.toNanos(sliceMs)
++        );
+     }
+ 
+     public int getTotalThreadCount() {
          return this.scheduler.getAliveThreads().length;
      }
  
@@ -403,7 +652,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
      private static void setTickingRegion(final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region) {
          final Thread currThread = Thread.currentThread();
          if (!(currThread instanceof TickThreadRunner tickThreadRunner)) {
-@@ -166,6 +180,7 @@ public final class TickRegionScheduler {
+@@ -166,6 +194,7 @@ public final class TickRegionScheduler {
          // To avoid acquiring any of the locks the scheduler may be using, we
          // simply cancel the next action.
          region.markNonSchedulable();
@@ -411,7 +660,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
      }
  
      public boolean halt(final boolean sync, final long maxWaitNS) {
-@@ -189,6 +204,20 @@ public final class TickRegionScheduler {
+@@ -189,6 +218,20 @@ public final class TickRegionScheduler {
          this.scheduler.notifyTasks(region);
      }
  
@@ -432,7 +681,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
      private void uncaughtException(final Thread thread, final Throwable thr) {
          LOGGER.error("Uncaught exception in tick thread \"" + thread.getName() + "\"", thr);
  
-@@ -230,7 +259,7 @@ public final class TickRegionScheduler {
+@@ -230,7 +273,7 @@ public final class TickRegionScheduler {
          }
      }
  
@@ -441,7 +690,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
  
          protected long currentTick;
          protected long lastTickStart;
-@@ -249,6 +278,10 @@ public final class TickRegionScheduler {
+@@ -249,6 +292,10 @@ public final class TickRegionScheduler {
          protected final Schedule tickSchedule;
  
          private TickRegionScheduler scheduler;
@@ -452,7 +701,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
  
          public RegionScheduleHandle(final TickRegions.TickRegionData region, final long firstStart) {
              this.currentTick = 0L;
-@@ -259,9 +292,12 @@ public final class TickRegionScheduler {
+@@ -259,9 +306,12 @@ public final class TickRegionScheduler {
              this.tickTimes5m = new TickData(TimeUnit.MINUTES.toNanos(5L));
              this.tickTimes15m = new TickData(TimeUnit.MINUTES.toNanos(15L));
              this.region = region;
@@ -465,7 +714,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
          }
  
          /**
-@@ -275,6 +311,7 @@ public final class TickRegionScheduler {
+@@ -275,6 +325,7 @@ public final class TickRegionScheduler {
  
          public final void markNonSchedulable() {
              this.cancelled.set(true);
@@ -473,7 +722,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
          }
  
          public final boolean isMarkedAsNonSchedulable() {
-@@ -304,6 +341,8 @@ public final class TickRegionScheduler {
+@@ -304,6 +355,8 @@ public final class TickRegionScheduler {
  
              final long cpuStart = MEASURE_CPU_TIME ? THREAD_MX_BEAN.getCurrentThreadCpuTime() : 0L;
              final long tickStart = System.nanoTime();
@@ -482,7 +731,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
  
              if (!this.tryMarkTicking()) {
                  if (!this.cancelled.get()) {
-@@ -316,6 +355,9 @@ public final class TickRegionScheduler {
+@@ -316,6 +369,9 @@ public final class TickRegionScheduler {
              TickRegionScheduler.setTickTask(this);
              if (this.region != null) {
                  TickRegionScheduler.setTickingRegion(this.region.region);
@@ -492,7 +741,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
              }
  
              synchronized (this) {
-@@ -348,6 +390,10 @@ public final class TickRegionScheduler {
+@@ -348,6 +404,10 @@ public final class TickRegionScheduler {
                  );
  
                  this.addTickTime(time);
@@ -503,7 +752,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
                  TickRegionScheduler.setTickTask(null);
                  if (this.region != null) {
                      TickRegionScheduler.setTickingRegion(null);
-@@ -387,6 +433,7 @@ public final class TickRegionScheduler {
+@@ -387,6 +447,7 @@ public final class TickRegionScheduler {
              TickRegionScheduler.setTickTask(this);
              if (this.region != null) {
                  TickRegionScheduler.setTickingRegion(this.region.region);
@@ -511,7 +760,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
              }
              this.incrementTickCount();
              final long lastTickStart = this.lastTickStart;
-@@ -429,6 +476,7 @@ public final class TickRegionScheduler {
+@@ -429,6 +490,7 @@ public final class TickRegionScheduler {
                  );
  
                  this.addTickTime(time);
@@ -519,7 +768,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
                  TickRegionScheduler.setTickTask(null);
                  if (this.region != null) {
                      TickRegionScheduler.setTickingRegion(null);
-@@ -454,6 +502,76 @@ public final class TickRegionScheduler {
+@@ -454,6 +516,76 @@ public final class TickRegionScheduler {
              }
          }
  
@@ -596,7 +845,7 @@ index 152166c6eb37876456fa1d981b35b87a49322d9d..83a6c01ccaa23d59637cf4de26dbbbec
          private TickTime adjustCurrentTickData(final long tickEnd) {
              final TickTime currentTickData = this.currentTickData;
              if (currentTickData == null) {
-@@ -586,4 +704,4 @@ public final class TickRegionScheduler {
+@@ -586,4 +718,4 @@ public final class TickRegionScheduler {
           * TPS: The number of ticks per second. It should be ticks / (sum of differenceFromLastTick).
           */
      }

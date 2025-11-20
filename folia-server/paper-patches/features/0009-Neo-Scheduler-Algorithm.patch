@@ -5,7 +5,7 @@ Subject: [PATCH] Neo Scheduler Algorithm
 
 
 diff --git a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
-index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f471fc60b1c 100644
+index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..76b5d2b096d451755af679ad679fdb1a0756c8ee 100644
 --- a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
 +++ b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
 @@ -3,6 +3,11 @@ package io.papermc.paper.threadedregions;
@@ -20,7 +20,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
  import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
  import net.minecraft.world.entity.Entity;
  import org.bukkit.craftbukkit.entity.CraftEntity;
-@@ -10,6 +15,7 @@ import org.bukkit.craftbukkit.entity.CraftEntity;
+@@ -10,9 +15,11 @@ import org.bukkit.craftbukkit.entity.CraftEntity;
  import java.util.ArrayDeque;
  import java.util.ArrayList;
  import java.util.List;
@@ -28,11 +28,69 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
  import java.util.concurrent.atomic.AtomicLong;
  import java.util.concurrent.locks.StampedLock;
  import java.util.function.Consumer;
-@@ -41,15 +47,17 @@ public final class EntityScheduler {
++import java.util.concurrent.TimeUnit;
+ 
+ /**
+  * An entity can move between worlds with an arbitrary tick delay, be temporarily removed
+@@ -41,15 +48,74 @@ public final class EntityScheduler {
      public final CraftEntity entity;
  
      private static final record ScheduledTask(Consumer<? extends Entity> run, Consumer<? extends Entity> retired) {}
-+    private static final record QueuedTask(ScheduledTask task, int lane, long creationNanos) {}
++    private static final class QueuedTask {
++
++        private final ScheduledTask task;
++        private int lane;
++        private final long creationNanos;
++        private long lastLaneUpdate;
++
++        private QueuedTask(final ScheduledTask task, final int lane, final long creationNanos) {
++            this.task = task;
++            this.lane = clampLane(lane);
++            this.creationNanos = creationNanos;
++            this.lastLaneUpdate = creationNanos;
++        }
++
++        private ScheduledTask task() {
++            return this.task;
++        }
++
++        private long creationNanos() {
++            return this.creationNanos;
++        }
++
++        private int lane() {
++            return this.lane;
++        }
++
++        private void promoteTo(final int candidateLane, final long now) {
++            final int clamped = clampLane(candidateLane);
++            if (clamped < this.lane) {
++                this.lane = clamped;
++                this.lastLaneUpdate = now;
++            }
++        }
++
++        private void demote(final long now) {
++            if (this.lane < MAX_TASK_LANES - 1) {
++                ++this.lane;
++                this.lastLaneUpdate = now;
++            }
++        }
++
++        private void age(final long now) {
++            if (this.lane == 0) {
++                return;
++            }
++            if (now - this.lastLaneUpdate >= LANE_AGING_NS) {
++                --this.lane;
++                this.lastLaneUpdate = now;
++            }
++        }
++
++        private static int clampLane(final int lane) {
++            return Math.max(0, Math.min(MAX_TASK_LANES - 1, lane));
++        }
++    }
  
      private long tickCount = 0L;
      private static final long RETIRED_TICK_COUNT = -1L;
@@ -45,10 +103,13 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
 -    private final ArrayDeque<ScheduledTask> currentlyExecuting = new ArrayDeque<>();
 +    private final ArrayDeque<QueuedTask> currentlyExecuting = new ArrayDeque<>();
 +    private static final int MAX_TASK_LANES = 3;
++    private static final int[] LANE_DISPATCH_QUANTUM = new int[] {3, 2, 1};
++    private static final long LANE_AGING_NS = TimeUnit.MILLISECONDS.toNanos(350L);
++    private static final int MAX_TASKS_PER_TICK = 32;
  
      public EntityScheduler(final CraftEntity entity) {
          this.entity = Validate.notNull(entity);
-@@ -60,6 +68,53 @@ public final class EntityScheduler {
+@@ -60,6 +126,96 @@ public final class EntityScheduler {
          return !this.currentlyExecuting.isEmpty() || !this.oneTimeDelayed.isEmpty();
      }
  
@@ -63,6 +124,9 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
 +    }
 +
 +    private void enqueueByLane(final List<QueuedTask> tasks, final double fairnessWeight) {
++        if (tasks.isEmpty()) {
++            return;
++        }
 +        final SchedulerFairnessMonitor monitor = TickRegionScheduler.getFairnessMonitor();
 +        final long now = System.nanoTime();
 +        final PriorityQueue<LaneEntry>[] lanes = new PriorityQueue[MAX_TASK_LANES];
@@ -76,16 +140,56 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
 +            });
 +        }
 +        for (final QueuedTask task : tasks) {
++            task.age(now);
 +            final long wait = Math.max(0L, now - task.creationNanos());
-+            final SchedulerFairnessMonitor.FairnessAdvice advice = monitor.advise(TaskCategory.ENTITY, fairnessWeight, wait);
-+            final int lane = Math.min(MAX_TASK_LANES - 1, Math.max(0, advice.queueLevel()));
-+            final long priority = this.saturatingAdd(task.creationNanos(), advice.startOffsetNanos());
-+            lanes[lane].add(new LaneEntry(task, priority));
++            final SchedulerFairnessMonitor.FairnessAdvice baseAdvice = monitor.advise(TaskCategory.ENTITY, fairnessWeight, wait);
++            final SchedulerFairnessMonitor.FairnessAdvice effectiveAdvice = monitor.applyPriorityBoost(
++                TaskCategory.ENTITY, this.entity.getEntityId(), baseAdvice
++            );
++            task.promoteTo(effectiveAdvice.queueLevel(), now);
++            final long priority = this.saturatingAdd(task.creationNanos(), effectiveAdvice.startOffsetNanos());
++            lanes[task.lane()].add(new LaneEntry(task, priority));
 +        }
-+        for (final PriorityQueue<LaneEntry> lane : lanes) {
-+            while (!lane.isEmpty()) {
-+                this.currentlyExecuting.addLast(lane.poll().task());
++        this.distributeLanes(lanes);
++    }
++
++    private void distributeLanes(final PriorityQueue<LaneEntry>[] lanes) {
++        boolean firstRound = true;
++        while (true) {
++            boolean moved = false;
++            for (int lane = 0; lane < lanes.length; ++lane) {
++                final int configuredBurst = lane < LANE_DISPATCH_QUANTUM.length ? LANE_DISPATCH_QUANTUM[lane] : 1;
++                int quota = firstRound ? configuredBurst : 1;
++                quota = Math.max(1, quota);
++                while (quota > 0 && !lanes[lane].isEmpty()) {
++                    this.currentlyExecuting.addLast(lanes[lane].poll().task());
++                    --quota;
++                    moved = true;
++                }
 +            }
++            firstRound = false;
++            if (!moved) {
++                break;
++            }
++        }
++    }
++
++    private void rebalanceDeferredTasks(final double fairnessWeight) {
++        if (this.currentlyExecuting.isEmpty()) {
++            return;
++        }
++        final ArrayList<QueuedTask> spillover = new ArrayList<>(this.currentlyExecuting);
++        this.currentlyExecuting.clear();
++        this.enqueueByLane(spillover, fairnessWeight);
++    }
++
++    private void markDeferredTasks() {
++        if (this.currentlyExecuting.isEmpty()) {
++            return;
++        }
++        final long now = System.nanoTime();
++        for (final QueuedTask queued : this.currentlyExecuting) {
++            queued.demote(now);
 +        }
 +    }
 +
@@ -102,7 +206,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
      public void registerTo(final EntitySchedulerTickList newTickList) {
          synchronized (this.stateLock) {
              final EntitySchedulerTickList prevList = this.scheduledList;
-@@ -131,7 +186,8 @@ public final class EntityScheduler {
+@@ -131,7 +287,8 @@ public final class EntityScheduler {
  
          // correctly handle and order retiring while running executeTick
          for (int i = 0, len = this.currentlyExecuting.size(); i < len; ++i) {
@@ -112,7 +216,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
              final Consumer<Entity> retireTask = (Consumer<Entity>)task.retired;
              if (retireTask == null) {
                  continue;
-@@ -140,9 +196,9 @@ public final class EntityScheduler {
+@@ -140,9 +297,9 @@ public final class EntityScheduler {
              retireTask.accept(thisEntity);
          }
  
@@ -124,7 +228,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
                  final Consumer<Entity> retireTask = (Consumer<Entity>)task.retired;
                  if (retireTask == null) {
                      continue;
-@@ -179,13 +235,16 @@ public final class EntityScheduler {
+@@ -179,13 +336,16 @@ public final class EntityScheduler {
          Validate.notNull(run, "Run task may not be null");
  
          final ScheduledTask task = new ScheduledTask(run, retired);
@@ -142,7 +246,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
  
              if (!this.insideScheduledList && this.scheduledList != null) {
                  this.scheduledList.add(this);
-@@ -205,46 +264,57 @@ public final class EntityScheduler {
+@@ -205,46 +365,67 @@ public final class EntityScheduler {
          final Entity thisEntity = this.entity.getHandleRaw();
  
          TickThread.ensureTickThread(thisEntity, "May not tick entity scheduler asynchronously");
@@ -157,6 +261,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
 +        final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> tickingRegion = TickRegionScheduler.getCurrentRegion();
 +        final TickRegions.TickRegionData currentRegion = tickingRegion != null ? tickingRegion.getData() : null;
 +        final double regionFairnessWeight = currentRegion != null ? currentRegion.getRegionSchedulingHandle().getFairnessWeight() : 1.0D;
++        this.rebalanceDeferredTasks(regionFairnessWeight);
 +        try {
 +            final List<QueuedTask> toRun;
 +            synchronized (this.stateLock) {
@@ -164,33 +269,29 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
 +                    throw new IllegalStateException("Ticking retired scheduler");
 +                }
 +                ++this.tickCount;
-+
+ 
+-            if (this.scheduledList != null && !this.hasTasks()) {
+-                this.scheduledList.remove(this);
+-                this.insideScheduledList = false;
+-            }
 +                if (this.scheduledList != null && !this.hasTasks()) {
 +                    this.scheduledList.remove(this);
 +                    this.insideScheduledList = false;
 +                }
  
--            if (this.scheduledList != null && !this.hasTasks()) {
--                this.scheduledList.remove(this);
--                this.insideScheduledList = false;
-+                toRun = this.oneTimeDelayed.isEmpty() ? null : this.oneTimeDelayed.remove(this.tickCount);
-             }
- 
 -            if (this.oneTimeDelayed.isEmpty()) {
 -                toRun = null;
 -            } else {
 -                toRun = this.oneTimeDelayed.remove(this.tickCount);
-+            if (toRun != null) {
-+                this.enqueueByLane(toRun, regionFairnessWeight);
++                toRun = this.oneTimeDelayed.isEmpty() ? null : this.oneTimeDelayed.remove(this.tickCount);
              }
 -        }
  
 -        if (toRun != null) {
 -            for (int i = 0, len = toRun.size(); i < len; ++i) {
 -                this.currentlyExecuting.addLast(toRun.get(i));
-+            if (!this.currentlyExecuting.isEmpty()) {
-+                fairnessTicket = monitor.begin(TaskCategory.ENTITY, this.entity.getEntityId(), regionFairnessWeight);
-+                monitor.markExecutionStart(fairnessTicket, System.nanoTime());
++            if (toRun != null) {
++                this.enqueueByLane(toRun, regionFairnessWeight);
              }
 -        }
  
@@ -200,8 +301,22 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
 -                // tp has been queued sync by one of the tasks
 -                // in this case, we need to delay the tasks for next tick
 -                break;
++            if (!this.currentlyExecuting.isEmpty()) {
++                fairnessTicket = monitor.begin(TaskCategory.ENTITY, this.entity.getEntityId(), regionFairnessWeight);
++                monitor.markExecutionStart(fairnessTicket, System.nanoTime());
+             }
+-            final ScheduledTask task = this.currentlyExecuting.pollFirst();
+ 
+-            if (this.tickCount != RETIRED_TICK_COUNT) {
+-                ((Consumer<Entity>)task.run).accept(thisEntity);
+-            } else {
+-                // retired synchronously
+-                // note: here task is null
+-                break;
++            int executedThisTick = 0;
++            boolean budgetHit = false;
 +            // Note: It is allowed for the tasks executed to retire the entity in a given task.
-+            for (int i = 0, len = this.currentlyExecuting.size(); i < len; ++i) {
++            while (!this.currentlyExecuting.isEmpty()) {
 +                if (!TickThread.isTickThreadFor(thisEntity)) {
 +                    // tp has been queued sync by one of the tasks
 +                    // in this case, we need to delay the tasks for next tick
@@ -217,15 +332,14 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
 +                    // note: here task is null
 +                    break;
 +                }
-             }
--            final ScheduledTask task = this.currentlyExecuting.pollFirst();
--
--            if (this.tickCount != RETIRED_TICK_COUNT) {
--                ((Consumer<Entity>)task.run).accept(thisEntity);
--            } else {
--                // retired synchronously
--                // note: here task is null
--                break;
++                if (++executedThisTick >= MAX_TASKS_PER_TICK) {
++                    budgetHit = true;
++                    break;
++                }
++            }
++            if (budgetHit) {
++                this.markDeferredTasks();
++            }
 +        } finally {
 +            if (fairnessTicket != null) {
 +                monitor.markExecutionEnd(fairnessTicket, System.nanoTime());
@@ -233,7 +347,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..8c193fa0995d0507da57c9cd197e7f47
          }
      }
 diff --git a/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java b/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java
-index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365b2ade2f7 100644
+index d306f911757a4d556c82c0070d4837db87afc497..39099dcf31b5155013c43232f7efabdfc6695a87 100644
 --- a/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java
 +++ b/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java
 @@ -2,6 +2,9 @@ package io.papermc.paper.threadedregions.scheduler;
@@ -303,7 +417,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365
  
          this.scheduleInternal(ret, initialDelayTicks);
  
-@@ -128,12 +143,169 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -128,12 +143,170 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
      private void scheduleInternal(final GlobalScheduledTask task, final long delay) {
          // note: delay > 0
          synchronized (this.stateLock) {
@@ -334,7 +448,8 @@ index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365
 +        for (final GlobalScheduledTask task : tasks) {
 +            final long wait = Math.max(0L, now - task.creationNanos);
 +            final double configuredWeight = monitor.resolveWeight(TaskCategory.GLOBAL, task.taskId, 1.0D);
-+            final SchedulerFairnessMonitor.FairnessAdvice advice = monitor.advise(TaskCategory.GLOBAL, configuredWeight, wait);
++            final SchedulerFairnessMonitor.FairnessAdvice baseAdvice = monitor.advise(TaskCategory.GLOBAL, configuredWeight, wait);
++            final SchedulerFairnessMonitor.FairnessAdvice advice = monitor.applyPriorityBoost(TaskCategory.GLOBAL, task.taskId, baseAdvice);
 +            final PluginTaskStats stats = this.pluginStats.computeIfAbsent(task.plugin, ignored -> new PluginTaskStats());
 +            final int lane = this.resolveLane(advice.queueLevel(), stats.currentQueueLevel(now), advice.weight(), lanes);
 +            final long predictedExec = stats.predictedExecNanos();
@@ -474,7 +589,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365
      private final class GlobalScheduledTask implements ScheduledTask, Runnable {
  
          private static final int STATE_IDLE                = 0;
-@@ -146,13 +318,19 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -146,13 +319,19 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
          private final long repeatDelay; // in ticks
          private Consumer<ScheduledTask> run;
          private volatile int state;
@@ -495,7 +610,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365
          }
  
          private final int getStateVolatile() {
-@@ -175,6 +353,9 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -175,6 +354,9 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                  return;
              }
  
@@ -505,7 +620,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365
              try {
                  this.run.accept(this);
              } catch (final Throwable throwable) {
-@@ -187,9 +368,17 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -187,9 +369,17 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                      reschedule = true;
                  } // else: cancelled repeating task
  
@@ -523,7 +638,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365
                      FoliaGlobalRegionScheduler.this.scheduleInternal(this, this.repeatDelay);
                  }
              }
-@@ -213,6 +402,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -213,6 +403,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                          if (STATE_IDLE == (curr = this.compareAndExchangeStateVolatile(STATE_IDLE, STATE_CANCELLED))) {
                              this.state = STATE_CANCELLED;
                              this.run = null;
@@ -531,7 +646,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365
                              return CancelledState.CANCELLED_BY_CALLER;
                          }
                          // try again
-@@ -223,6 +413,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -223,6 +414,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                              return CancelledState.RUNNING;
                          }
                          if (STATE_EXECUTING == (curr = this.compareAndExchangeStateVolatile(STATE_EXECUTING, STATE_EXECUTING_CANCELLED))) {
@@ -539,7 +654,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365
                              return CancelledState.NEXT_RUNS_CANCELLED;
                          }
                          // try again
-@@ -232,6 +423,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -232,6 +424,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                          return CancelledState.NEXT_RUNS_CANCELLED_ALREADY;
                      }
                      case STATE_FINISHED: {
@@ -547,7 +662,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..d1e87e229e9c3533ddebc32a73f0f365
                          return CancelledState.ALREADY_EXECUTED;
                      }
                      case STATE_CANCELLED: {
-@@ -263,5 +455,68 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -263,5 +456,68 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                  }
              }
          }
