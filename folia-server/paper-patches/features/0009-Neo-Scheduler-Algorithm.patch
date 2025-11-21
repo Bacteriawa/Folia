@@ -4,8 +4,20 @@ Date: Wed, 12 Nov 2025 01:53:17 +0800
 Subject: [PATCH] Neo Scheduler Algorithm
 
 
+diff --git a/src/main/java/io/papermc/paper/command/PaperCommands.java b/src/main/java/io/papermc/paper/command/PaperCommands.java
+index 3deca0b4e95609dc95376a86b5cbd525729a1031..9b10c176a59c8e5e3a133721b90a1a84fec5128e 100644
+--- a/src/main/java/io/papermc/paper/command/PaperCommands.java
++++ b/src/main/java/io/papermc/paper/command/PaperCommands.java
+@@ -26,6 +26,7 @@ public final class PaperCommands {
+         COMMANDS.put("mspt", new MSPTCommand("mspt"));
+         COMMANDS.put("tps", new io.papermc.paper.threadedregions.commands.CommandServerHealth()); // Folia - region threading
+         COMMANDS.put("profiler", new io.papermc.paper.threadedregions.commands.CommandProfiler()); // Folia - region threading - profiler
++        COMMANDS.put("scheduler", new io.papermc.paper.threadedregions.commands.CommandSchedulerMetrics()); // Folia - scheduler metrics
+ 
+         COMMANDS.forEach((s, command) -> {
+             server.server.getCommandMap().register(s, "Paper", command);
 diff --git a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
-index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..76b5d2b096d451755af679ad679fdb1a0756c8ee 100644
+index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca3e1745d1 100644
 --- a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
 +++ b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
 @@ -3,6 +3,11 @@ package io.papermc.paper.threadedregions;
@@ -32,7 +44,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..76b5d2b096d451755af679ad679fdb1a
  
  /**
   * An entity can move between worlds with an arbitrary tick delay, be temporarily removed
-@@ -41,15 +48,74 @@ public final class EntityScheduler {
+@@ -41,15 +48,97 @@ public final class EntityScheduler {
      public final CraftEntity entity;
  
      private static final record ScheduledTask(Consumer<? extends Entity> run, Consumer<? extends Entity> retired) {}
@@ -42,12 +54,15 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..76b5d2b096d451755af679ad679fdb1a
 +        private int lane;
 +        private final long creationNanos;
 +        private long lastLaneUpdate;
++        private SchedulerFairnessMonitor.FairnessTicket fairnessTicket;
 +
-+        private QueuedTask(final ScheduledTask task, final int lane, final long creationNanos) {
++        private QueuedTask(final ScheduledTask task, final int lane, final long creationNanos,
++                           final SchedulerFairnessMonitor.FairnessTicket fairnessTicket) {
 +            this.task = task;
 +            this.lane = clampLane(lane);
 +            this.creationNanos = creationNanos;
 +            this.lastLaneUpdate = creationNanos;
++            this.fairnessTicket = fairnessTicket;
 +        }
 +
 +        private ScheduledTask task() {
@@ -87,6 +102,26 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..76b5d2b096d451755af679ad679fdb1a
 +            }
 +        }
 +
++        private void markFairnessStart(final SchedulerFairnessMonitor monitor, final long startTime) {
++            if (this.fairnessTicket != null) {
++                monitor.markExecutionStart(this.fairnessTicket, startTime);
++            }
++        }
++
++        private void markFairnessEnd(final SchedulerFairnessMonitor monitor, final long endTime) {
++            if (this.fairnessTicket != null) {
++                monitor.markExecutionEnd(this.fairnessTicket, endTime);
++                this.fairnessTicket = null;
++            }
++        }
++
++        private void cancelFairness(final SchedulerFairnessMonitor monitor) {
++            if (this.fairnessTicket != null) {
++                monitor.cancel(this.fairnessTicket);
++                this.fairnessTicket = null;
++            }
++        }
++
 +        private static int clampLane(final int lane) {
 +            return Math.max(0, Math.min(MAX_TASK_LANES - 1, lane));
 +        }
@@ -109,7 +144,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..76b5d2b096d451755af679ad679fdb1a
  
      public EntityScheduler(final CraftEntity entity) {
          this.entity = Validate.notNull(entity);
-@@ -60,6 +126,96 @@ public final class EntityScheduler {
+@@ -60,6 +149,96 @@ public final class EntityScheduler {
          return !this.currentlyExecuting.isEmpty() || !this.oneTimeDelayed.isEmpty();
      }
  
@@ -206,17 +241,22 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..76b5d2b096d451755af679ad679fdb1a
      public void registerTo(final EntitySchedulerTickList newTickList) {
          synchronized (this.stateLock) {
              final EntitySchedulerTickList prevList = this.scheduledList;
-@@ -131,7 +287,8 @@ public final class EntityScheduler {
+@@ -128,10 +307,13 @@ public final class EntityScheduler {
+         }
+ 
+         final Entity thisEntity = this.entity.getHandleRaw();
++        final SchedulerFairnessMonitor monitor = TickRegionScheduler.getFairnessMonitor();
  
          // correctly handle and order retiring while running executeTick
          for (int i = 0, len = this.currentlyExecuting.size(); i < len; ++i) {
 -            final ScheduledTask task = this.currentlyExecuting.pollFirst();
 +            final QueuedTask queued = this.currentlyExecuting.pollFirst();
++            queued.cancelFairness(monitor);
 +            final ScheduledTask task = queued.task();
              final Consumer<Entity> retireTask = (Consumer<Entity>)task.retired;
              if (retireTask == null) {
                  continue;
-@@ -140,9 +297,9 @@ public final class EntityScheduler {
+@@ -140,9 +322,11 @@ public final class EntityScheduler {
              retireTask.accept(thisEntity);
          }
  
@@ -224,21 +264,27 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..76b5d2b096d451755af679ad679fdb1a
 +        for (final List<QueuedTask> tasks : this.oneTimeDelayed.values()) {
              for (int i = 0, len = tasks.size(); i < len; ++i) {
 -                final ScheduledTask task = tasks.get(i);
-+                final ScheduledTask task = tasks.get(i).task();
++                final QueuedTask queued = tasks.get(i);
++                queued.cancelFairness(monitor);
++                final ScheduledTask task = queued.task();
                  final Consumer<Entity> retireTask = (Consumer<Entity>)task.retired;
                  if (retireTask == null) {
                      continue;
-@@ -179,13 +336,16 @@ public final class EntityScheduler {
+@@ -179,13 +363,20 @@ public final class EntityScheduler {
          Validate.notNull(run, "Run task may not be null");
  
          final ScheduledTask task = new ScheduledTask(run, retired);
 +        final int taskLane = this.classifyLane(delay);
++        final SchedulerFairnessMonitor monitor = TickRegionScheduler.getFairnessMonitor();
          synchronized (this.stateLock) {
              if (this.tickCount == RETIRED_TICK_COUNT) {
                  return false;
              }
 +            final long createdAt = System.nanoTime();
-+            final QueuedTask queuedTask = new QueuedTask(task, taskLane, createdAt);
++            final SchedulerFairnessMonitor.FairnessTicket fairnessTicket = monitor.begin(
++                TaskCategory.ENTITY, this.entity.getEntityId(), 1.0D
++            );
++            final QueuedTask queuedTask = new QueuedTask(task, taskLane, createdAt, fairnessTicket);
              this.oneTimeDelayed.computeIfAbsent(this.tickCount + Math.max(1L, delay), (final long keyInMap) -> {
                  return new ArrayList<>();
 -            }).add(task);
@@ -246,108 +292,77 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..76b5d2b096d451755af679ad679fdb1a
  
              if (!this.insideScheduledList && this.scheduledList != null) {
                  this.scheduledList.add(this);
-@@ -205,46 +365,67 @@ public final class EntityScheduler {
+@@ -205,7 +396,12 @@ public final class EntityScheduler {
          final Entity thisEntity = this.entity.getHandleRaw();
  
          TickThread.ensureTickThread(thisEntity, "May not tick entity scheduler asynchronously");
 -        final List<ScheduledTask> toRun;
--        synchronized (this.stateLock) {
--            if (this.tickCount == RETIRED_TICK_COUNT) {
--                throw new IllegalStateException("Ticking retired scheduler");
--            }
--            ++this.tickCount;
 +        final SchedulerFairnessMonitor monitor = TickRegionScheduler.getFairnessMonitor();
-+        SchedulerFairnessMonitor.FairnessTicket fairnessTicket = null;
 +        final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> tickingRegion = TickRegionScheduler.getCurrentRegion();
 +        final TickRegions.TickRegionData currentRegion = tickingRegion != null ? tickingRegion.getData() : null;
 +        final double regionFairnessWeight = currentRegion != null ? currentRegion.getRegionSchedulingHandle().getFairnessWeight() : 1.0D;
 +        this.rebalanceDeferredTasks(regionFairnessWeight);
-+        try {
-+            final List<QueuedTask> toRun;
-+            synchronized (this.stateLock) {
-+                if (this.tickCount == RETIRED_TICK_COUNT) {
-+                    throw new IllegalStateException("Ticking retired scheduler");
-+                }
-+                ++this.tickCount;
- 
--            if (this.scheduledList != null && !this.hasTasks()) {
--                this.scheduledList.remove(this);
--                this.insideScheduledList = false;
--            }
-+                if (this.scheduledList != null && !this.hasTasks()) {
-+                    this.scheduledList.remove(this);
-+                    this.insideScheduledList = false;
-+                }
++        final List<QueuedTask> toRun;
+         synchronized (this.stateLock) {
+             if (this.tickCount == RETIRED_TICK_COUNT) {
+                 throw new IllegalStateException("Ticking retired scheduler");
+@@ -217,36 +413,43 @@ public final class EntityScheduler {
+                 this.insideScheduledList = false;
+             }
  
 -            if (this.oneTimeDelayed.isEmpty()) {
 -                toRun = null;
 -            } else {
 -                toRun = this.oneTimeDelayed.remove(this.tickCount);
-+                toRun = this.oneTimeDelayed.isEmpty() ? null : this.oneTimeDelayed.remove(this.tickCount);
-             }
--        }
+-            }
++            toRun = this.oneTimeDelayed.isEmpty() ? null : this.oneTimeDelayed.remove(this.tickCount);
+         }
  
--        if (toRun != null) {
+         if (toRun != null) {
 -            for (int i = 0, len = toRun.size(); i < len; ++i) {
 -                this.currentlyExecuting.addLast(toRun.get(i));
-+            if (toRun != null) {
-+                this.enqueueByLane(toRun, regionFairnessWeight);
-             }
--        }
+-            }
++            this.enqueueByLane(toRun, regionFairnessWeight);
+         }
  
--        // Note: It is allowed for the tasks executed to retire the entity in a given task.
++        int executedThisTick = 0;
++        boolean budgetHit = false;
+         // Note: It is allowed for the tasks executed to retire the entity in a given task.
 -        for (int i = 0, len = this.currentlyExecuting.size(); i < len; ++i) {
--            if (!TickThread.isTickThreadFor(thisEntity)) {
--                // tp has been queued sync by one of the tasks
--                // in this case, we need to delay the tasks for next tick
--                break;
-+            if (!this.currentlyExecuting.isEmpty()) {
-+                fairnessTicket = monitor.begin(TaskCategory.ENTITY, this.entity.getEntityId(), regionFairnessWeight);
-+                monitor.markExecutionStart(fairnessTicket, System.nanoTime());
++        while (!this.currentlyExecuting.isEmpty()) {
+             if (!TickThread.isTickThreadFor(thisEntity)) {
+                 // tp has been queued sync by one of the tasks
+                 // in this case, we need to delay the tasks for next tick
+                 break;
              }
 -            final ScheduledTask task = this.currentlyExecuting.pollFirst();
++            final QueuedTask queuedTask = this.currentlyExecuting.pollFirst();
++            final ScheduledTask task = queuedTask.task();
  
--            if (this.tickCount != RETIRED_TICK_COUNT) {
--                ((Consumer<Entity>)task.run).accept(thisEntity);
--            } else {
--                // retired synchronously
++            final long startTime = System.nanoTime();
++            queuedTask.markFairnessStart(monitor, startTime);
+             if (this.tickCount != RETIRED_TICK_COUNT) {
+                 ((Consumer<Entity>)task.run).accept(thisEntity);
++                queuedTask.markFairnessEnd(monitor, System.nanoTime());
+             } else {
+                 // retired synchronously
 -                // note: here task is null
--                break;
-+            int executedThisTick = 0;
-+            boolean budgetHit = false;
-+            // Note: It is allowed for the tasks executed to retire the entity in a given task.
-+            while (!this.currentlyExecuting.isEmpty()) {
-+                if (!TickThread.isTickThreadFor(thisEntity)) {
-+                    // tp has been queued sync by one of the tasks
-+                    // in this case, we need to delay the tasks for next tick
-+                    break;
-+                }
-+                final QueuedTask queuedTask = this.currentlyExecuting.pollFirst();
-+                final ScheduledTask task = queuedTask.task();
-+
-+                if (this.tickCount != RETIRED_TICK_COUNT) {
-+                    ((Consumer<Entity>)task.run).accept(thisEntity);
-+                } else {
-+                    // retired synchronously
-+                    // note: here task is null
-+                    break;
-+                }
-+                if (++executedThisTick >= MAX_TASKS_PER_TICK) {
-+                    budgetHit = true;
-+                    break;
-+                }
++                queuedTask.cancelFairness(monitor);
++                break;
 +            }
-+            if (budgetHit) {
-+                this.markDeferredTasks();
-+            }
-+        } finally {
-+            if (fairnessTicket != null) {
-+                monitor.markExecutionEnd(fairnessTicket, System.nanoTime());
++            if (++executedThisTick >= MAX_TASKS_PER_TICK) {
++                budgetHit = true;
+                 break;
              }
          }
++        if (budgetHit) {
++            this.markDeferredTasks();
++        }
      }
+ 
+     public static final class EntitySchedulerTickList {
 diff --git a/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java b/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java
-index d306f911757a4d556c82c0070d4837db87afc497..39099dcf31b5155013c43232f7efabdfc6695a87 100644
+index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322ad1b238bd 100644
 --- a/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java
 +++ b/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java
 @@ -2,6 +2,9 @@ package io.papermc.paper.threadedregions.scheduler;
@@ -626,13 +641,13 @@ index d306f911757a4d556c82c0070d4837db87afc497..39099dcf31b5155013c43232f7efabdf
  
 +                final long end = System.nanoTime();
 +                monitor.markExecutionEnd(this.fairnessTicket, end);
++                this.fairnessTicket = null;
 +                final ThresholdProfile thresholdsForStats = FoliaGlobalRegionScheduler.this.currentThresholdProfile(monitor.getLoadLevel());
 +                FoliaGlobalRegionScheduler.this.pluginStats
 +                    .computeIfAbsent(this.plugin, ignored -> new PluginTaskStats())
 +                    .recordExecution(end - start, thresholdsForStats);
                  if (!reschedule) {
                      this.run = null;
-+                    this.disposeFairnessTicket();
                  } else {
 +                    this.fairnessTicket = TickRegionScheduler.getFairnessMonitor().begin(TaskCategory.GLOBAL, this.taskId, this.resolveTaskWeight());
                      FoliaGlobalRegionScheduler.this.scheduleInternal(this, this.repeatDelay);
@@ -646,15 +661,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..39099dcf31b5155013c43232f7efabdf
                              return CancelledState.CANCELLED_BY_CALLER;
                          }
                          // try again
-@@ -223,6 +414,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
-                             return CancelledState.RUNNING;
-                         }
-                         if (STATE_EXECUTING == (curr = this.compareAndExchangeStateVolatile(STATE_EXECUTING, STATE_EXECUTING_CANCELLED))) {
-+                            this.disposeFairnessTicket();
-                             return CancelledState.NEXT_RUNS_CANCELLED;
-                         }
-                         // try again
-@@ -232,6 +424,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -232,6 +423,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                          return CancelledState.NEXT_RUNS_CANCELLED_ALREADY;
                      }
                      case STATE_FINISHED: {
@@ -662,16 +669,18 @@ index d306f911757a4d556c82c0070d4837db87afc497..39099dcf31b5155013c43232f7efabdf
                          return CancelledState.ALREADY_EXECUTED;
                      }
                      case STATE_CANCELLED: {
-@@ -263,5 +456,68 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -263,5 +455,70 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                  }
              }
          }
 +
 +        private void disposeFairnessTicket() {
-+            if (this.fairnessTicket != null) {
-+                TickRegionScheduler.getFairnessMonitor().cancel(this.fairnessTicket);
-+                this.fairnessTicket = null;
++            final SchedulerFairnessMonitor.FairnessTicket ticket = this.fairnessTicket;
++            if (ticket == null) {
++                return;
 +            }
++            TickRegionScheduler.getFairnessMonitor().cancel(ticket);
++            this.fairnessTicket = null;
 +        }
 +
 +        private double resolveTaskWeight() {
