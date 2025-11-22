@@ -4,20 +4,8 @@ Date: Wed, 12 Nov 2025 01:53:17 +0800
 Subject: [PATCH] Neo Scheduler Algorithm
 
 
-diff --git a/src/main/java/io/papermc/paper/command/PaperCommands.java b/src/main/java/io/papermc/paper/command/PaperCommands.java
-index 3deca0b4e95609dc95376a86b5cbd525729a1031..9b10c176a59c8e5e3a133721b90a1a84fec5128e 100644
---- a/src/main/java/io/papermc/paper/command/PaperCommands.java
-+++ b/src/main/java/io/papermc/paper/command/PaperCommands.java
-@@ -26,6 +26,7 @@ public final class PaperCommands {
-         COMMANDS.put("mspt", new MSPTCommand("mspt"));
-         COMMANDS.put("tps", new io.papermc.paper.threadedregions.commands.CommandServerHealth()); // Folia - region threading
-         COMMANDS.put("profiler", new io.papermc.paper.threadedregions.commands.CommandProfiler()); // Folia - region threading - profiler
-+        COMMANDS.put("scheduler", new io.papermc.paper.threadedregions.commands.CommandSchedulerMetrics()); // Folia - scheduler metrics
- 
-         COMMANDS.forEach((s, command) -> {
-             server.server.getCommandMap().register(s, "Paper", command);
 diff --git a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
-index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca3e1745d1 100644
+index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..22672a4d944ef75b6ce2542bad9eb26254dff1db 100644
 --- a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
 +++ b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
 @@ -3,6 +3,11 @@ package io.papermc.paper.threadedregions;
@@ -44,7 +32,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
  
  /**
   * An entity can move between worlds with an arbitrary tick delay, be temporarily removed
-@@ -41,15 +48,97 @@ public final class EntityScheduler {
+@@ -41,15 +48,113 @@ public final class EntityScheduler {
      public final CraftEntity entity;
  
      private static final record ScheduledTask(Consumer<? extends Entity> run, Consumer<? extends Entity> retired) {}
@@ -53,6 +41,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
 +        private final ScheduledTask task;
 +        private int lane;
 +        private final long creationNanos;
++        private long readyNanos;
 +        private long lastLaneUpdate;
 +        private SchedulerFairnessMonitor.FairnessTicket fairnessTicket;
 +
@@ -61,6 +50,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
 +            this.task = task;
 +            this.lane = clampLane(lane);
 +            this.creationNanos = creationNanos;
++            this.readyNanos = creationNanos;
 +            this.lastLaneUpdate = creationNanos;
 +            this.fairnessTicket = fairnessTicket;
 +        }
@@ -71,6 +61,14 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
 +
 +        private long creationNanos() {
 +            return this.creationNanos;
++        }
++
++        private void markReady(final long now) {
++            this.readyNanos = now;
++        }
++
++        private long readyNanos() {
++            return this.readyNanos;
 +        }
 +
 +        private int lane() {
@@ -125,6 +123,12 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
 +        private static int clampLane(final int lane) {
 +            return Math.max(0, Math.min(MAX_TASK_LANES - 1, lane));
 +        }
++
++        private void ensureFairnessTicket(final SchedulerFairnessMonitor monitor, final long entityId, final double weight) {
++            if (this.fairnessTicket == null) {
++                this.fairnessTicket = monitor.begin(TaskCategory.ENTITY, entityId, weight);
++            }
++        }
 +    }
  
      private long tickCount = 0L;
@@ -144,7 +148,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
  
      public EntityScheduler(final CraftEntity entity) {
          this.entity = Validate.notNull(entity);
-@@ -60,6 +149,96 @@ public final class EntityScheduler {
+@@ -60,6 +165,97 @@ public final class EntityScheduler {
          return !this.currentlyExecuting.isEmpty() || !this.oneTimeDelayed.isEmpty();
      }
  
@@ -176,7 +180,8 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
 +        }
 +        for (final QueuedTask task : tasks) {
 +            task.age(now);
-+            final long wait = Math.max(0L, now - task.creationNanos());
++            task.ensureFairnessTicket(monitor, this.entity.getEntityId(), fairnessWeight);
++            final long wait = Math.max(0L, now - task.readyNanos());
 +            final SchedulerFairnessMonitor.FairnessAdvice baseAdvice = monitor.advise(TaskCategory.ENTITY, fairnessWeight, wait);
 +            final SchedulerFairnessMonitor.FairnessAdvice effectiveAdvice = monitor.applyPriorityBoost(
 +                TaskCategory.ENTITY, this.entity.getEntityId(), baseAdvice
@@ -241,7 +246,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
      public void registerTo(final EntitySchedulerTickList newTickList) {
          synchronized (this.stateLock) {
              final EntitySchedulerTickList prevList = this.scheduledList;
-@@ -128,10 +307,13 @@ public final class EntityScheduler {
+@@ -128,10 +324,13 @@ public final class EntityScheduler {
          }
  
          final Entity thisEntity = this.entity.getHandleRaw();
@@ -256,7 +261,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
              final Consumer<Entity> retireTask = (Consumer<Entity>)task.retired;
              if (retireTask == null) {
                  continue;
-@@ -140,9 +322,11 @@ public final class EntityScheduler {
+@@ -140,9 +339,11 @@ public final class EntityScheduler {
              retireTask.accept(thisEntity);
          }
  
@@ -270,21 +275,17 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
                  final Consumer<Entity> retireTask = (Consumer<Entity>)task.retired;
                  if (retireTask == null) {
                      continue;
-@@ -179,13 +363,20 @@ public final class EntityScheduler {
+@@ -179,13 +380,16 @@ public final class EntityScheduler {
          Validate.notNull(run, "Run task may not be null");
  
          final ScheduledTask task = new ScheduledTask(run, retired);
 +        final int taskLane = this.classifyLane(delay);
-+        final SchedulerFairnessMonitor monitor = TickRegionScheduler.getFairnessMonitor();
          synchronized (this.stateLock) {
              if (this.tickCount == RETIRED_TICK_COUNT) {
                  return false;
              }
 +            final long createdAt = System.nanoTime();
-+            final SchedulerFairnessMonitor.FairnessTicket fairnessTicket = monitor.begin(
-+                TaskCategory.ENTITY, this.entity.getEntityId(), 1.0D
-+            );
-+            final QueuedTask queuedTask = new QueuedTask(task, taskLane, createdAt, fairnessTicket);
++            final QueuedTask queuedTask = new QueuedTask(task, taskLane, createdAt, null);
              this.oneTimeDelayed.computeIfAbsent(this.tickCount + Math.max(1L, delay), (final long keyInMap) -> {
                  return new ArrayList<>();
 -            }).add(task);
@@ -292,7 +293,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
  
              if (!this.insideScheduledList && this.scheduledList != null) {
                  this.scheduledList.add(this);
-@@ -205,7 +396,12 @@ public final class EntityScheduler {
+@@ -205,7 +409,12 @@ public final class EntityScheduler {
          final Entity thisEntity = this.entity.getHandleRaw();
  
          TickThread.ensureTickThread(thisEntity, "May not tick entity scheduler asynchronously");
@@ -306,7 +307,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
          synchronized (this.stateLock) {
              if (this.tickCount == RETIRED_TICK_COUNT) {
                  throw new IllegalStateException("Ticking retired scheduler");
-@@ -217,36 +413,43 @@ public final class EntityScheduler {
+@@ -217,36 +426,47 @@ public final class EntityScheduler {
                  this.insideScheduledList = false;
              }
  
@@ -321,7 +322,10 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
          if (toRun != null) {
 -            for (int i = 0, len = toRun.size(); i < len; ++i) {
 -                this.currentlyExecuting.addLast(toRun.get(i));
--            }
++            final long readyTime = System.nanoTime();
++            for (final QueuedTask queued : toRun) {
++                queued.markReady(readyTime);
+             }
 +            this.enqueueByLane(toRun, regionFairnessWeight);
          }
  
@@ -362,7 +366,7 @@ index 48ca6582a7b1bc30bbff3337ff6360ac8e73cfe7..0ddadc3bcc020630aee208479bf557ca
  
      public static final class EntitySchedulerTickList {
 diff --git a/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java b/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java
-index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322ad1b238bd 100644
+index d306f911757a4d556c82c0070d4837db87afc497..c4c444752f5b8c169317ac4b519c7a6f446993de 100644
 --- a/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java
 +++ b/src/main/java/io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler.java
 @@ -2,6 +2,9 @@ package io.papermc.paper.threadedregions.scheduler;
@@ -403,18 +407,21 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
  
      public void tick() {
          final List<GlobalScheduledTask> run;
-@@ -33,9 +50,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -33,9 +50,11 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
              return;
          }
  
 -        for (int i = 0, len = run.size(); i < len; ++i) {
 -            run.get(i).run();
--        }
++        for (final GlobalScheduledTask task : run) {
++            task.armForExecution();
+         }
++
 +        this.dispatchFairly(run);
      }
  
      @Override
-@@ -65,7 +80,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -65,7 +84,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
              throw new IllegalPluginAccessException("Plugin attempted to register task while disabled");
          }
  
@@ -423,7 +430,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
  
          this.scheduleInternal(ret, delayTicks);
  
-@@ -92,7 +107,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -92,7 +111,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
              throw new IllegalPluginAccessException("Plugin attempted to register task while disabled");
          }
  
@@ -432,7 +439,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
  
          this.scheduleInternal(ret, initialDelayTicks);
  
-@@ -128,12 +143,170 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -128,12 +147,170 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
      private void scheduleInternal(final GlobalScheduledTask task, final long delay) {
          // note: delay > 0
          synchronized (this.stateLock) {
@@ -604,7 +611,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
      private final class GlobalScheduledTask implements ScheduledTask, Runnable {
  
          private static final int STATE_IDLE                = 0;
-@@ -146,13 +319,19 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -146,13 +323,18 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
          private final long repeatDelay; // in ticks
          private Consumer<ScheduledTask> run;
          private volatile int state;
@@ -621,11 +628,10 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
              this.repeatDelay = repeatDelay;
              this.run = run;
 +            this.taskId = taskId;
-+            this.fairnessTicket = TickRegionScheduler.getFairnessMonitor().begin(TaskCategory.GLOBAL, taskId, this.resolveTaskWeight());
          }
  
          private final int getStateVolatile() {
-@@ -175,6 +354,9 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -175,6 +357,9 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                  return;
              }
  
@@ -635,7 +641,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
              try {
                  this.run.accept(this);
              } catch (final Throwable throwable) {
-@@ -187,9 +369,17 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -187,6 +372,13 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                      reschedule = true;
                  } // else: cancelled repeating task
  
@@ -649,11 +655,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
                  if (!reschedule) {
                      this.run = null;
                  } else {
-+                    this.fairnessTicket = TickRegionScheduler.getFairnessMonitor().begin(TaskCategory.GLOBAL, this.taskId, this.resolveTaskWeight());
-                     FoliaGlobalRegionScheduler.this.scheduleInternal(this, this.repeatDelay);
-                 }
-             }
-@@ -213,6 +403,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -213,6 +405,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                          if (STATE_IDLE == (curr = this.compareAndExchangeStateVolatile(STATE_IDLE, STATE_CANCELLED))) {
                              this.state = STATE_CANCELLED;
                              this.run = null;
@@ -661,7 +663,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
                              return CancelledState.CANCELLED_BY_CALLER;
                          }
                          // try again
-@@ -232,6 +423,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -232,6 +425,7 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                          return CancelledState.NEXT_RUNS_CANCELLED_ALREADY;
                      }
                      case STATE_FINISHED: {
@@ -669,7 +671,7 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
                          return CancelledState.ALREADY_EXECUTED;
                      }
                      case STATE_CANCELLED: {
-@@ -263,5 +455,70 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
+@@ -263,5 +457,76 @@ public class FoliaGlobalRegionScheduler implements GlobalRegionScheduler {
                  }
              }
          }
@@ -685,6 +687,12 @@ index d306f911757a4d556c82c0070d4837db87afc497..7264bbc365ce1dfb499eecea047a322a
 +
 +        private double resolveTaskWeight() {
 +            return TickRegionScheduler.getFairnessMonitor().resolveWeight(TaskCategory.GLOBAL, this.taskId, 1.0D);
++        }
++
++        void armForExecution() {
++            this.creationNanos = System.nanoTime();
++            this.disposeFairnessTicket();
++            this.fairnessTicket = TickRegionScheduler.getFairnessMonitor().begin(TaskCategory.GLOBAL, this.taskId, this.resolveTaskWeight());
 +        }
 +
 +        void refreshCreationTime() {
